@@ -21,11 +21,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"strconv"
 	_ "unsafe"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/internal"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/utils"
@@ -64,9 +66,7 @@ const (
 	RetryMode       = "glue.retry-mode"
 )
 
-var (
-	_ catalog.Catalog = (*Catalog)(nil)
-)
+var _ catalog.Catalog = (*Catalog)(nil)
 
 func init() {
 	catalog.Register("glue", catalog.RegistrarFunc(func(ctx context.Context, _ string, props iceberg.Properties) (catalog.Catalog, error) {
@@ -155,33 +155,36 @@ func NewCatalog(opts ...Option) *Catalog {
 // ListTables returns a list of Iceberg tables in the given Glue database.
 //
 // The namespace should just contain the Glue database name.
-func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) ([]table.Identifier, error) {
-	database, err := identifierToGlueDatabase(namespace)
-	if err != nil {
-		return nil, err
-	}
-
-	params := &glue.GetTablesInput{CatalogId: c.catalogId, DatabaseName: aws.String(database)}
-
-	var icebergTables []table.Identifier
-
-	for {
-		tblsRes, err := c.glueSvc.GetTables(ctx, params)
+func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
+	return func(yield func(table.Identifier, error) bool) {
+		database, err := identifierToGlueDatabase(namespace)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list tables in namespace %s: %w", database, err)
+			yield(table.Identifier{}, err)
+
+			return
 		}
 
-		icebergTables = append(icebergTables,
-			filterTableListByType(database, tblsRes.TableList, glueTypeIceberg)...)
+		paginator := glue.NewGetTablesPaginator(c.glueSvc, &glue.GetTablesInput{
+			CatalogId:    c.catalogId,
+			DatabaseName: aws.String(database),
+		})
 
-		if tblsRes.NextToken == nil {
-			break
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				yield(table.Identifier{}, fmt.Errorf("failed to list tables in namespace %s: %w", database, err))
+
+				return
+			}
+
+			icebergTables := filterTableListByType(database, page.TableList, glueTypeIceberg)
+			for _, tbl := range icebergTables {
+				if !yield(tbl, nil) {
+					return
+				}
+			}
 		}
-
-		params.NextToken = tblsRes.NextToken
 	}
-
-	return icebergTables, nil
 }
 
 // LoadTable loads a table from the catalog table details.
@@ -214,7 +217,7 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 		return nil, fmt.Errorf("failed to load table %s.%s: %w", database, tableName, err)
 	}
 
-	icebergTable, err := table.NewFromLocation([]string{tableName}, location, iofs)
+	icebergTable, err := table.NewFromLocation([]string{tableName}, location, iofs, c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create table from location %s.%s: %w", database, tableName, err)
 	}
@@ -226,8 +229,63 @@ func (c *Catalog) CatalogType() catalog.Type {
 	return catalog.Glue
 }
 
+// CreateTable creates a new Iceberg table in the Glue catalog.
+// AWS Glue will create a new table and a new metadata file in S3 with the format: metadataLocation/metadata/00000-00000-00000-00000-00000.metadata.json.
 func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, opts ...catalog.CreateTableOpt) (*table.Table, error) {
-	panic("create table not implemented for Glue Catalog")
+	database, tableName, err := identifierToGlueTable(identifier)
+	if err != nil {
+		return nil, err
+	}
+	var cfg internal.CreateTableCfg
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.Location == "" {
+		return nil, errors.New("metadata location is required for table creation")
+	}
+	parameters := map[string]string{}
+	for k, v := range cfg.Properties {
+		parameters[k] = v
+	}
+	tableInput := &types.TableInput{
+		Name:       aws.String(tableName),
+		Parameters: parameters,
+		TableType:  aws.String("EXTERNAL_TABLE"),
+		StorageDescriptor: &types.StorageDescriptor{
+			Location: aws.String(cfg.Location),
+			Columns:  schemaToGlueColumns(schema),
+		},
+	}
+	_, err = c.glueSvc.CreateTable(ctx, &glue.CreateTableInput{
+		CatalogId:    c.catalogId,
+		DatabaseName: aws.String(database),
+		TableInput:   tableInput,
+		OpenTableFormatInput: &types.OpenTableFormatInput{
+			IcebergInput: &types.IcebergInput{
+				MetadataOperation: types.MetadataOperationCreate,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create table %s.%s: %w", database, tableName, err)
+	}
+	createdTable, err := c.LoadTable(ctx, identifier, cfg.Properties)
+	if err != nil {
+		// Attempt to clean up the table if loading fails
+		_, cleanupErr := c.glueSvc.DeleteTable(ctx, &glue.DeleteTableInput{
+			CatalogId:    c.catalogId,
+			DatabaseName: aws.String(database),
+			Name:         aws.String(tableName),
+		})
+		if cleanupErr != nil {
+			return nil, fmt.Errorf("failed to create table %s.%s and cleanup failed: %v (original error: %w)",
+				database, tableName, cleanupErr, err)
+		}
+
+		return nil, fmt.Errorf("failed to create table %s.%s: %w", database, tableName, err)
+	}
+
+	return createdTable, nil
 }
 
 func (c *Catalog) CommitTable(context.Context, *table.Table, []table.Requirement, []table.Update) (table.Metadata, string, error) {
@@ -355,12 +413,25 @@ func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifie
 
 	params := &glue.CreateDatabaseInput{CatalogId: c.catalogId, DatabaseInput: databaseInput}
 	_, err = c.glueSvc.CreateDatabase(ctx, params)
-
 	if err != nil {
 		return fmt.Errorf("failed to create database %s: %w", database, err)
 	}
 
 	return nil
+}
+
+func (c *Catalog) CheckNamespaceExists(ctx context.Context, namespace table.Identifier) (bool, error) {
+	databaseName, err := identifierToGlueDatabase(namespace)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = c.getDatabase(ctx, databaseName)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // DropNamespace deletes an Iceberg namespace from the Glue catalog.
@@ -416,8 +487,8 @@ func getUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals [
 // UpdateNamespaceProperties updates the properties of an Iceberg namespace in the Glue catalog.
 // The removals list contains the keys to remove, and the updates map contains the keys and values to update.
 func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table.Identifier,
-	removals []string, updates iceberg.Properties) (catalog.PropertiesUpdateSummary, error) {
-
+	removals []string, updates iceberg.Properties,
+) (catalog.PropertiesUpdateSummary, error) {
 	databaseName, err := identifierToGlueDatabase(namespace)
 	if err != nil {
 		return catalog.PropertiesUpdateSummary{}, err
@@ -451,7 +522,7 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 	}
 
 	if parent != nil {
-		return nil, fmt.Errorf("hierarchical namespace is not supported")
+		return nil, errors.New("hierarchical namespace is not supported")
 	}
 
 	var icebergNamespaces []table.Identifier
@@ -488,6 +559,7 @@ func (c *Catalog) getTable(ctx context.Context, database, tableName string) (*ty
 		if errors.Is(err, &types.EntityNotFoundException{}) {
 			return nil, fmt.Errorf("failed to get table %s.%s: %w", database, tableName, catalog.ErrNoSuchTable)
 		}
+
 		return nil, fmt.Errorf("failed to get table %s.%s: %w", database, tableName, err)
 	}
 
@@ -505,6 +577,7 @@ func (c *Catalog) getDatabase(ctx context.Context, databaseName string) (*types.
 		if errors.Is(err, &types.EntityNotFoundException{}) {
 			return nil, fmt.Errorf("failed to get namespace %s: %w", databaseName, catalog.ErrNoSuchNamespace)
 		}
+
 		return nil, fmt.Errorf("failed to get namespace %s: %w", databaseName, err)
 	}
 
@@ -543,7 +616,6 @@ func DatabaseIdentifier(database string) table.Identifier {
 
 func filterTableListByType(database string, tableList []types.Table, tableType string) []table.Identifier {
 	var filtered []table.Identifier
-
 	for _, tbl := range tableList {
 		if tbl.Parameters[tableTypePropsKey] != tableType {
 			continue

@@ -37,8 +37,9 @@ import (
 )
 
 const (
-	TestCreds = "client:secret"
-	TestToken = "some_jwt_token"
+	TestCreds       = "client:secret"
+	TestToken       = "some_jwt_token"
+	defaultPageSize = 20
 )
 
 var (
@@ -234,13 +235,17 @@ func (r *RestCatalogSuite) TestToken401() {
 
 func (r *RestCatalogSuite) TestListTables200() {
 	namespace := "examples"
+	customPageSize := 100
 	r.mux.HandleFunc("/v1/namespaces/"+namespace+"/tables", func(w http.ResponseWriter, req *http.Request) {
 		r.Require().Equal(http.MethodGet, req.Method)
 
 		for k, v := range TestHeaders {
 			r.Equal(v, req.Header.Values(k))
 		}
-
+		pageToken := req.URL.Query().Get("page-token")
+		pageSize := req.URL.Query().Get("page-size")
+		r.Equal("", pageToken)
+		r.Equal(strconv.Itoa(customPageSize), pageSize)
 		json.NewEncoder(w).Encode(map[string]any{
 			"identifiers": []any{
 				map[string]any{
@@ -254,9 +259,22 @@ func (r *RestCatalogSuite) TestListTables200() {
 	cat, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL, rest.WithOAuthToken(TestToken))
 	r.Require().NoError(err)
 
-	tables, err := cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
-	r.Require().NoError(err)
-	r.Equal([]table.Identifier{{"examples", "fooshare"}}, tables)
+	ctx := cat.SetPageSize(context.Background(), customPageSize)
+
+	var lastErr error
+	tbls := make([]table.Identifier, 0)
+
+	iter := cat.ListTables(ctx, catalog.ToIdentifier(namespace))
+
+	for tbl, err := range iter {
+		tbls = append(tbls, tbl)
+		if err != nil {
+			lastErr = err
+			r.FailNow("unexpected error:", err)
+		}
+	}
+	r.Require().NoError(lastErr)
+	r.Equal([]table.Identifier{{"examples", "fooshare"}}, tbls)
 }
 
 func (r *RestCatalogSuite) TestListTablesPrefixed200() {
@@ -289,6 +307,10 @@ func (r *RestCatalogSuite) TestListTablesPrefixed200() {
 		for k, v := range TestHeaders {
 			r.Equal(v, req.Header.Values(k))
 		}
+		pageToken := req.URL.Query().Get("page-token")
+		pageSize := req.URL.Query().Get("page-size")
+		r.Equal("", pageToken)
+		r.Equal(strconv.Itoa(defaultPageSize), pageSize)
 
 		json.NewEncoder(w).Encode(map[string]any{
 			"identifiers": []any{
@@ -309,9 +331,176 @@ func (r *RestCatalogSuite) TestListTablesPrefixed200() {
 	r.NotNil(cat)
 	r.Equal(r.configVals.Get("warehouse"), "s3://some-bucket")
 
-	tables, err := cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
+	var lastErr error
+	tbls := make([]table.Identifier, 0)
+
+	iter := cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
+
+	for tbl, err := range iter {
+		tbls = append(tbls, tbl)
+		if err != nil {
+			lastErr = err
+			r.FailNow("unexpected error:", err)
+		}
+	}
+	r.Require().NoError(lastErr)
+	r.Equal([]table.Identifier{{"examples", "fooshare"}}, tbls)
+}
+
+func (r *RestCatalogSuite) TestListTablesPagination() {
+	defaultPageSize := 20
+	namespace := "accounting"
+	r.mux.HandleFunc("/v1/namespaces/"+namespace+"/tables", func(w http.ResponseWriter, req *http.Request) {
+		r.Require().Equal(http.MethodGet, req.Method)
+
+		for k, v := range TestHeaders {
+			r.Equal(v, req.Header.Values(k))
+		}
+
+		pageToken := req.URL.Query().Get("page-token")
+		pageSize := req.URL.Query().Get("page-size")
+		r.Equal(strconv.Itoa(defaultPageSize), pageSize)
+
+		var response map[string]any
+		if pageToken == "" {
+			response = map[string]any{
+				"identifiers": []any{
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "paid1",
+					},
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "paid2",
+					},
+				},
+				"next-page-token": "token1",
+			}
+		} else if pageToken == "token1" {
+			r.Equal("token1", pageToken)
+			response = map[string]any{
+				"identifiers": []any{
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "pending1",
+					},
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "pending2",
+					},
+				},
+				"next-page-token": "token2",
+			}
+		} else {
+			r.Equal("token2", pageToken)
+			response = map[string]any{
+				"identifiers": []any{
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "owned",
+					},
+				},
+			}
+		}
+
+		json.NewEncoder(w).Encode(response)
+	})
+
+	cat, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL, rest.WithOAuthToken(TestToken))
 	r.Require().NoError(err)
-	r.Equal([]table.Identifier{{"examples", "fooshare"}}, tables)
+
+	var lastErr error
+	tbls := make([]table.Identifier, 0)
+	iter := cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
+	for tbl, err := range iter {
+		tbls = append(tbls, tbl)
+		if err != nil {
+			lastErr = err
+			r.FailNow("unexpected error:", err)
+		}
+	}
+
+	r.Equal([]table.Identifier{
+		{"accounting", "paid1"},
+		{"accounting", "paid2"},
+		{"accounting", "pending1"},
+		{"accounting", "pending2"},
+		{"accounting", "owned"},
+	}, tbls)
+	r.Require().NoError(lastErr)
+}
+
+func (r *RestCatalogSuite) TestListTablesPaginationErrorOnSubsequentPage() {
+	namespace := "accounting"
+	r.mux.HandleFunc("/v1/namespaces/"+namespace+"/tables", func(w http.ResponseWriter, req *http.Request) {
+		r.Require().Equal(http.MethodGet, req.Method)
+
+		for k, v := range TestHeaders {
+			r.Equal(v, req.Header.Values(k))
+		}
+
+		pageToken := req.URL.Query().Get("page-token")
+
+		// First page succeeds
+		if pageToken == "" {
+			json.NewEncoder(w).Encode(map[string]any{
+				"identifiers": []any{
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "paid1",
+					},
+					map[string]any{
+						"namespace": []string{namespace},
+						"name":      "paid2",
+					},
+				},
+				"next-page-token": "token1",
+			})
+
+			return
+		}
+
+		// Second page fails with an error
+		if pageToken == "token1" {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "Token expired or invalid",
+					"type":    "NoSuchPageTokenException",
+					"code":    404,
+				},
+			})
+
+			return
+		}
+
+		r.FailNow("unexpected page token:", pageToken)
+	})
+
+	cat, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL, rest.WithOAuthToken(TestToken))
+	r.Require().NoError(err)
+
+	tbls := make([]table.Identifier, 0)
+	var lastErr error
+	iter := cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
+	for tbl, err := range iter {
+		if err != nil {
+			lastErr = err
+
+			break
+		}
+		tbls = append(tbls, tbl)
+	}
+
+	// Check that we got the views from the first page
+	r.Equal([]table.Identifier{
+		{"accounting", "paid1"},
+		{"accounting", "paid2"},
+	}, tbls)
+
+	// Check that we got the error from the second page
+	r.Error(lastErr)
+	r.ErrorContains(lastErr, "Token expired or invalid")
 }
 
 func (r *RestCatalogSuite) TestListTables404() {
@@ -323,6 +512,10 @@ func (r *RestCatalogSuite) TestListTables404() {
 			r.Equal(v, req.Header.Values(k))
 		}
 
+		pageToken := req.URL.Query().Get("page-token")
+		pageSize := req.URL.Query().Get("page-size")
+		r.Equal("", pageToken)
+		r.Equal(strconv.Itoa(defaultPageSize), pageSize)
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]any{
@@ -336,9 +529,19 @@ func (r *RestCatalogSuite) TestListTables404() {
 	cat, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL, rest.WithOAuthToken(TestToken))
 	r.Require().NoError(err)
 
-	_, err = cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
-	r.ErrorIs(err, catalog.ErrNoSuchNamespace)
-	r.ErrorContains(err, "Namespace does not exist: personal in warehouse 8bcb0838-50fc-472d-9ddb-8feb89ef5f1e")
+	var lastErr error
+	tbls := make([]table.Identifier, 0)
+
+	iter := cat.ListTables(context.Background(), catalog.ToIdentifier(namespace))
+
+	for tbl, err := range iter {
+		tbls = append(tbls, tbl)
+		if err != nil {
+			lastErr = err
+		}
+	}
+	r.ErrorIs(lastErr, catalog.ErrNoSuchNamespace)
+	r.ErrorContains(lastErr, "Namespace does not exist")
 }
 
 func (r *RestCatalogSuite) TestListNamespaces200() {
@@ -797,7 +1000,7 @@ func (r *RestCatalogSuite) TestCreateTable200() {
 	)
 	r.Require().NoError(err)
 
-	r.Equal(catalog.ToIdentifier("rest", "fokko", "fokko2"), tbl.Identifier())
+	r.Equal(catalog.ToIdentifier("fokko", "fokko2"), tbl.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata.json", tbl.MetadataLocation())
 	r.EqualValues(1, tbl.Metadata().Version())
 	r.Equal("bf289591-dcc0-4234-ad4f-5c3eed811a29", tbl.Metadata().TableUUID().String())
@@ -972,7 +1175,7 @@ func (r *RestCatalogSuite) TestLoadTable200() {
 	tbl, err := cat.LoadTable(context.Background(), catalog.ToIdentifier("fokko", "table"), nil)
 	r.Require().NoError(err)
 
-	r.Equal(catalog.ToIdentifier("rest", "fokko", "table"), tbl.Identifier())
+	r.Equal(catalog.ToIdentifier("fokko", "table"), tbl.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata/00001-5f2f8166-244c-4eae-ac36-384ecdec81fc.gz.metadata.json", tbl.MetadataLocation())
 	r.EqualValues(1, tbl.Metadata().Version())
 	r.Equal("b55d9dda-6561-423a-8bfc-787980ce421f", tbl.Metadata().TableUUID().String())
@@ -1056,7 +1259,7 @@ func (r *RestCatalogSuite) TestRenameTable200() {
 	renamedTable, err := cat.RenameTable(context.Background(), fromIdent, toIdent)
 	r.Require().NoError(err)
 
-	r.Equal(catalog.ToIdentifier("rest", "fokko", "destination"), renamedTable.Identifier())
+	r.Equal(catalog.ToIdentifier("fokko", "destination"), renamedTable.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata.json", renamedTable.MetadataLocation())
 	r.EqualValues(1, renamedTable.Metadata().Version())
 	r.Equal("bf289591-dcc0-4234-ad4f-5c3eed811a29", renamedTable.Metadata().TableUUID().String())
@@ -1258,7 +1461,7 @@ func (r *RestCatalogSuite) TestRegisterTable200() {
 	tbl, err := cat.RegisterTable(context.Background(), catalog.ToIdentifier("fokko", "fokko2"), "s3://warehouse/database/table/metadata/00001-5f2f8166-244c-4eae-ac36-384ecdec81fc.gz.metadata.json")
 	r.Require().NoError(err)
 
-	r.Equal(catalog.ToIdentifier("rest", "fokko", "fokko2"), tbl.Identifier())
+	r.Equal(catalog.ToIdentifier("fokko", "fokko2"), tbl.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata/00001-5f2f8166-244c-4eae-ac36-384ecdec81fc.gz.metadata.json", tbl.MetadataLocation())
 	r.EqualValues(1, tbl.Metadata().Version())
 	r.Equal("d55d9dda-6561-423a-8bfc-787980ce421f", tbl.Metadata().TableUUID().String())
@@ -1493,6 +1696,7 @@ func (r *RestCatalogSuite) TestListViewsPaginationErrorOnSubsequentPage() {
 				},
 				"next-page-token": "token1",
 			})
+
 			return
 		}
 
@@ -1506,6 +1710,7 @@ func (r *RestCatalogSuite) TestListViewsPaginationErrorOnSubsequentPage() {
 					"code":    404,
 				},
 			})
+
 			return
 		}
 
@@ -1521,6 +1726,7 @@ func (r *RestCatalogSuite) TestListViewsPaginationErrorOnSubsequentPage() {
 	for view, err := range iter {
 		if err != nil {
 			lastErr = err
+
 			break
 		}
 		views = append(views, view)

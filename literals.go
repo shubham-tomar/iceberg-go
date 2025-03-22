@@ -56,6 +56,7 @@ type Literal interface {
 	fmt.Stringer
 	encoding.BinaryMarshaler
 
+	Any() any
 	Type() Type
 	To(Type) (Literal, error)
 	Equals(Literal) bool
@@ -108,6 +109,12 @@ func NewLiteral[T LiteralType](val T) Literal {
 	panic("can't happen due to literal type constraint")
 }
 
+func getComparator[T LiteralType]() Comparator[T] {
+	var z T
+
+	return NewLiteral(z).(TypedLiteral[T]).Comparator()
+}
+
 // LiteralFromBytes uses the defined Iceberg spec for how to serialize a value of
 // a the provided type and returns the appropriate Literal value from it.
 //
@@ -124,30 +131,37 @@ func LiteralFromBytes(typ Type, data []byte) (Literal, error) {
 	case BooleanType:
 		var v BoolLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case Int32Type:
 		var v Int32Literal
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case Int64Type:
 		var v Int64Literal
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case Float32Type:
 		var v Float32Literal
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case Float64Type:
 		var v Float64Literal
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case StringType:
 		var v StringLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case BinaryType:
 		var v BinaryLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case FixedType:
 		if len(data) != t.Len() {
@@ -160,26 +174,32 @@ func LiteralFromBytes(typ Type, data []byte) (Literal, error) {
 		}
 		var v FixedLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case DecimalType:
 		v := DecimalLiteral{Scale: t.scale}
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case DateType:
 		var v DateLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case TimeType:
 		var v TimeLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case TimestampType, TimestampTzType:
 		var v TimestampLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	case UUIDType:
 		var v UUIDLiteral
 		err := v.UnmarshalBinary(data)
+
 		return v, err
 	}
 
@@ -246,12 +266,13 @@ func (ab aboveMaxLiteral[T]) To(t Type) (Literal, error) {
 	if ab.Type().Equals(t) {
 		return ab, nil
 	}
+
 	return nil, fmt.Errorf("%w: cannot change type of AboveMax%sLiteral",
 		ErrBadCast, reflect.TypeOf(T(0)).String())
 }
 
-func (ab aboveMaxLiteral[T]) Value() T { return ab.value }
-
+func (ab aboveMaxLiteral[T]) Value() T       { return ab.value }
+func (ab aboveMaxLiteral[T]) Any() any       { return ab.Value() }
 func (ab aboveMaxLiteral[T]) String() string { return "AboveMax" }
 func (ab aboveMaxLiteral[T]) Equals(other Literal) bool {
 	// AboveMaxLiteral isn't comparable and thus isn't even equal to itself
@@ -289,12 +310,13 @@ func (bm belowMinLiteral[T]) To(t Type) (Literal, error) {
 	if bm.Type().Equals(t) {
 		return bm, nil
 	}
+
 	return nil, fmt.Errorf("%w: cannot change type of BelowMin%sLiteral",
 		ErrBadCast, reflect.TypeOf(T(0)).String())
 }
 
-func (bm belowMinLiteral[T]) Value() T { return bm.value }
-
+func (bm belowMinLiteral[T]) Value() T       { return bm.value }
+func (bm belowMinLiteral[T]) Any() any       { return bm.Value() }
 func (bm belowMinLiteral[T]) String() string { return "BelowMin" }
 func (bm belowMinLiteral[T]) Equals(other Literal) bool {
 	// BelowMinLiteral isn't comparable and thus isn't even equal to itself
@@ -341,12 +363,15 @@ func (BoolLiteral) Comparator() Comparator[bool] {
 			if v2 {
 				return 0
 			}
+
 			return 1
 		}
+
 		return -1
 	}
 }
 
+func (b BoolLiteral) Any() any       { return b.Value() }
 func (b BoolLiteral) Type() Type     { return PrimitiveTypes.Bool }
 func (b BoolLiteral) Value() bool    { return bool(b) }
 func (b BoolLiteral) String() string { return strconv.FormatBool(bool(b)) }
@@ -355,6 +380,7 @@ func (b BoolLiteral) To(t Type) (Literal, error) {
 	case BooleanType:
 		return b, nil
 	}
+
 	return nil, fmt.Errorf("%w: BoolLiteral to %s", ErrBadCast, t)
 }
 
@@ -362,15 +388,14 @@ func (b BoolLiteral) Equals(l Literal) bool {
 	return literalEq(b, l)
 }
 
-var (
-	falseBin, trueBin = [1]byte{0x0}, [1]byte{0x1}
-)
+var falseBin, trueBin = [1]byte{0x0}, [1]byte{0x1}
 
 func (b BoolLiteral) MarshalBinary() (data []byte, err error) {
 	// stored as 0x00 for false, and anything non-zero for True
 	if b {
 		return trueBin[:], nil
 	}
+
 	return falseBin[:], nil
 }
 
@@ -380,6 +405,7 @@ func (b *BoolLiteral) UnmarshalBinary(data []byte) error {
 		return fmt.Errorf("%w: expected at least 1 byte for bool", ErrInvalidBinSerialization)
 	}
 	*b = data[0] != 0
+
 	return nil
 }
 
@@ -388,6 +414,7 @@ type Int32Literal int32
 func (Int32Literal) Comparator() Comparator[int32] { return cmp.Compare[int32] }
 func (i Int32Literal) Type() Type                  { return PrimitiveTypes.Int32 }
 func (i Int32Literal) Value() int32                { return int32(i) }
+func (i Int32Literal) Any() any                    { return i.Value() }
 func (i Int32Literal) String() string              { return strconv.FormatInt(int64(i), 10) }
 func (i Int32Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
@@ -416,6 +443,7 @@ func (i Int32Literal) To(t Type) (Literal, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: failed to cast to DecimalType: %s", ErrBadCast, err.Error())
 		}
+
 		return DecimalLiteral{Val: out, Scale: t.scale}, nil
 	}
 
@@ -446,6 +474,7 @@ func (i Int32Literal) MarshalBinary() (data []byte, err error) {
 	// stored as 4 bytes in little endian order
 	data = make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, uint32(i))
+
 	return
 }
 
@@ -457,6 +486,7 @@ func (i *Int32Literal) UnmarshalBinary(data []byte) error {
 	}
 
 	*i = Int32Literal(binary.LittleEndian.Uint32(data))
+
 	return nil
 }
 
@@ -465,6 +495,7 @@ type Int64Literal int64
 func (Int64Literal) Comparator() Comparator[int64] { return cmp.Compare[int64] }
 func (i Int64Literal) Type() Type                  { return PrimitiveTypes.Int64 }
 func (i Int64Literal) Value() int64                { return int64(i) }
+func (i Int64Literal) Any() any                    { return i.Value() }
 func (i Int64Literal) String() string              { return strconv.FormatInt(int64(i), 10) }
 func (i Int64Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
@@ -474,6 +505,7 @@ func (i Int64Literal) To(t Type) (Literal, error) {
 		} else if math.MinInt32 > i {
 			return Int32BelowMinLiteral(), nil
 		}
+
 		return Int32Literal(i), nil
 	case Int64Type:
 		return i, nil
@@ -498,6 +530,7 @@ func (i Int64Literal) To(t Type) (Literal, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: failed to cast to DecimalType: %s", ErrBadCast, err.Error())
 		}
+
 		return DecimalLiteral{Val: out, Scale: t.scale}, nil
 	}
 
@@ -528,6 +561,7 @@ func (i Int64Literal) MarshalBinary() (data []byte, err error) {
 	// stored as 8 byte little-endian
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, uint64(i))
+
 	return
 }
 
@@ -538,6 +572,7 @@ func (i *Int64Literal) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*i = Int64Literal(binary.LittleEndian.Uint64(data))
+
 	return nil
 }
 
@@ -546,6 +581,7 @@ type Float32Literal float32
 func (Float32Literal) Comparator() Comparator[float32] { return cmp.Compare[float32] }
 func (f Float32Literal) Type() Type                    { return PrimitiveTypes.Float32 }
 func (f Float32Literal) Value() float32                { return float32(f) }
+func (f Float32Literal) Any() any                      { return f.Value() }
 func (f Float32Literal) String() string                { return strconv.FormatFloat(float64(f), 'g', -1, 32) }
 func (f Float32Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
@@ -558,6 +594,7 @@ func (f Float32Literal) To(t Type) (Literal, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		return DecimalLiteral{Val: v, Scale: t.scale}, nil
 	}
 
@@ -572,6 +609,7 @@ func (f Float32Literal) MarshalBinary() (data []byte, err error) {
 	// stored as 4 bytes little endian
 	data = make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, math.Float32bits(float32(f)))
+
 	return
 }
 
@@ -582,6 +620,7 @@ func (f *Float32Literal) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*f = Float32Literal(math.Float32frombits(binary.LittleEndian.Uint32(data)))
+
 	return nil
 }
 
@@ -590,6 +629,7 @@ type Float64Literal float64
 func (Float64Literal) Comparator() Comparator[float64] { return cmp.Compare[float64] }
 func (f Float64Literal) Type() Type                    { return PrimitiveTypes.Float64 }
 func (f Float64Literal) Value() float64                { return float64(f) }
+func (f Float64Literal) Any() any                      { return f.Value() }
 func (f Float64Literal) String() string                { return strconv.FormatFloat(float64(f), 'g', -1, 64) }
 func (f Float64Literal) To(t Type) (Literal, error) {
 	switch t := t.(type) {
@@ -599,6 +639,7 @@ func (f Float64Literal) To(t Type) (Literal, error) {
 		} else if -math.MaxFloat32 > f {
 			return Float32BelowMinLiteral(), nil
 		}
+
 		return Float32Literal(f), nil
 	case Float64Type:
 		return f, nil
@@ -607,6 +648,7 @@ func (f Float64Literal) To(t Type) (Literal, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		return DecimalLiteral{Val: v, Scale: t.scale}, nil
 	}
 
@@ -621,6 +663,7 @@ func (f Float64Literal) MarshalBinary() (data []byte, err error) {
 	// stored as 8 bytes little endian
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, math.Float64bits(float64(f)))
+
 	return
 }
 
@@ -631,6 +674,7 @@ func (f *Float64Literal) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*f = Float64Literal(math.Float64frombits(binary.LittleEndian.Uint64(data)))
+
 	return nil
 }
 
@@ -639,17 +683,22 @@ type DateLiteral Date
 func (DateLiteral) Comparator() Comparator[Date] { return cmp.Compare[Date] }
 func (d DateLiteral) Type() Type                 { return PrimitiveTypes.Date }
 func (d DateLiteral) Value() Date                { return Date(d) }
+func (d DateLiteral) Any() any                   { return d.Value() }
 func (d DateLiteral) String() string {
 	t := Date(d).ToTime()
+
 	return t.Format("2006-01-02")
 }
+
 func (d DateLiteral) To(t Type) (Literal, error) {
 	switch t.(type) {
 	case DateType:
 		return d, nil
 	}
+
 	return nil, fmt.Errorf("%w: DateLiteral to %s", ErrBadCast, t)
 }
+
 func (d DateLiteral) Equals(other Literal) bool {
 	return literalEq(d, other)
 }
@@ -661,6 +710,7 @@ func (d DateLiteral) MarshalBinary() (data []byte, err error) {
 	// stored as 4 byte little endian
 	data = make([]byte, 4)
 	binary.LittleEndian.PutUint32(data, uint32(d))
+
 	return
 }
 
@@ -671,6 +721,7 @@ func (d *DateLiteral) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*d = DateLiteral(binary.LittleEndian.Uint32(data))
+
 	return nil
 }
 
@@ -679,18 +730,22 @@ type TimeLiteral Time
 func (TimeLiteral) Comparator() Comparator[Time] { return cmp.Compare[Time] }
 func (t TimeLiteral) Type() Type                 { return PrimitiveTypes.Time }
 func (t TimeLiteral) Value() Time                { return Time(t) }
+func (t TimeLiteral) Any() any                   { return t.Value() }
 func (t TimeLiteral) String() string {
 	tm := time.UnixMicro(int64(t)).UTC()
+
 	return tm.Format("15:04:05.000000")
 }
+
 func (t TimeLiteral) To(typ Type) (Literal, error) {
 	switch typ.(type) {
 	case TimeType:
 		return t, nil
 	}
-	return nil, fmt.Errorf("%w: TimeLiteral to %s", ErrBadCast, typ)
 
+	return nil, fmt.Errorf("%w: TimeLiteral to %s", ErrBadCast, typ)
 }
+
 func (t TimeLiteral) Equals(other Literal) bool {
 	return literalEq(t, other)
 }
@@ -699,6 +754,7 @@ func (t TimeLiteral) MarshalBinary() (data []byte, err error) {
 	// stored as 8 byte little-endian
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, uint64(t))
+
 	return
 }
 
@@ -709,6 +765,7 @@ func (t *TimeLiteral) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*t = TimeLiteral(binary.LittleEndian.Uint64(data))
+
 	return nil
 }
 
@@ -717,10 +774,13 @@ type TimestampLiteral Timestamp
 func (TimestampLiteral) Comparator() Comparator[Timestamp] { return cmp.Compare[Timestamp] }
 func (t TimestampLiteral) Type() Type                      { return PrimitiveTypes.Timestamp }
 func (t TimestampLiteral) Value() Timestamp                { return Timestamp(t) }
+func (t TimestampLiteral) Any() any                        { return t.Value() }
 func (t TimestampLiteral) String() string {
 	tm := Timestamp(t).ToTime()
+
 	return tm.Format("2006-01-02 15:04:05.000000")
 }
+
 func (t TimestampLiteral) To(typ Type) (Literal, error) {
 	switch typ.(type) {
 	case TimestampType:
@@ -730,8 +790,10 @@ func (t TimestampLiteral) To(typ Type) (Literal, error) {
 	case DateType:
 		return DateLiteral(Timestamp(t).ToDate()), nil
 	}
+
 	return nil, fmt.Errorf("%w: TimestampLiteral to %s", ErrBadCast, typ)
 }
+
 func (t TimestampLiteral) Equals(other Literal) bool {
 	return literalEq(t, other)
 }
@@ -743,6 +805,7 @@ func (t TimestampLiteral) MarshalBinary() (data []byte, err error) {
 	// stored as 8 byte little endian
 	data = make([]byte, 8)
 	binary.LittleEndian.PutUint64(data, uint64(t))
+
 	return
 }
 
@@ -753,6 +816,7 @@ func (t *TimestampLiteral) UnmarshalBinary(data []byte) error {
 			ErrInvalidBinSerialization, len(data))
 	}
 	*t = TimestampLiteral(binary.LittleEndian.Uint64(data))
+
 	return nil
 }
 
@@ -761,6 +825,7 @@ type StringLiteral string
 func (StringLiteral) Comparator() Comparator[string] { return cmp.Compare[string] }
 func (s StringLiteral) Type() Type                   { return PrimitiveTypes.String }
 func (s StringLiteral) Value() string                { return string(s) }
+func (s StringLiteral) Any() any                     { return s.Value() }
 func (s StringLiteral) String() string               { return string(s) }
 func (s StringLiteral) To(typ Type) (Literal, error) {
 	switch t := typ.(type) {
@@ -794,6 +859,7 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: casting '%s' to %s",
 				errors.Join(ErrBadCast, err), s, typ)
 		}
+
 		return Float32Literal(n), nil
 	case Float64Type:
 		n, err := strconv.ParseFloat(string(s), 64)
@@ -801,6 +867,7 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: casting '%s' to %s",
 				errors.Join(ErrBadCast, err), s, typ)
 		}
+
 		return Float64Literal(n), nil
 	case DateType:
 		tm, err := time.Parse("2006-01-02", string(s))
@@ -808,6 +875,7 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: casting '%s' to %s - %s",
 				ErrBadCast, s, typ, err.Error())
 		}
+
 		return DateLiteral(tm.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds())), nil
 	case TimeType:
 		val, err := arrow.Time64FromString(string(s), arrow.Microsecond)
@@ -841,6 +909,7 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: casting '%s' to %s - %s",
 				ErrBadCast, s, typ, err.Error())
 		}
+
 		return UUIDLiteral(val), nil
 	case DecimalType:
 		n, err := decimal128.FromString(string(s), int32(t.precision), int32(t.scale))
@@ -848,6 +917,7 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: casting '%s' to %s - %s",
 				ErrBadCast, s, typ, err.Error())
 		}
+
 		return DecimalLiteral{Val: n, Scale: t.scale}, nil
 	case BooleanType:
 		val, err := strconv.ParseBool(string(s))
@@ -855,6 +925,7 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: casting '%s' to %s - %s",
 				ErrBadCast, s, typ, err.Error())
 		}
+
 		return BoolLiteral(val), nil
 	case BinaryType:
 		return BinaryLiteral(s), nil
@@ -863,8 +934,10 @@ func (s StringLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: cast '%s' to %s - wrong length",
 				ErrBadCast, s, t)
 		}
+
 		return FixedLiteral(s), nil
 	}
+
 	return nil, fmt.Errorf("%w: StringLiteral to %s", ErrBadCast, typ)
 }
 
@@ -876,6 +949,7 @@ func (s StringLiteral) MarshalBinary() (data []byte, err error) {
 	// stored as UTF-8 bytes without length
 	// avoid copying by just returning a slice of the raw bytes
 	data = unsafe.Slice(unsafe.StringData(string(s)), len(s))
+
 	return
 }
 
@@ -884,6 +958,7 @@ func (s *StringLiteral) UnmarshalBinary(data []byte) error {
 	// avoid copy, but this means that the passed in slice is being given
 	// to the literal for ownership
 	*s = StringLiteral(unsafe.String(unsafe.SliceData(data), len(data)))
+
 	return nil
 }
 
@@ -894,6 +969,7 @@ func (BinaryLiteral) Comparator() Comparator[[]byte] {
 }
 func (b BinaryLiteral) Type() Type     { return PrimitiveTypes.Binary }
 func (b BinaryLiteral) Value() []byte  { return []byte(b) }
+func (b BinaryLiteral) Any() any       { return b.Value() }
 func (b BinaryLiteral) String() string { return string(b) }
 func (b BinaryLiteral) To(typ Type) (Literal, error) {
 	switch t := typ.(type) {
@@ -903,6 +979,7 @@ func (b BinaryLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: cannot convert BinaryLiteral to UUID",
 				errors.Join(ErrBadCast, err))
 		}
+
 		return UUIDLiteral(val), nil
 	case FixedType:
 		if len(b) == t.len {
@@ -917,6 +994,7 @@ func (b BinaryLiteral) To(typ Type) (Literal, error) {
 
 	return nil, fmt.Errorf("%w: BinaryLiteral to %s", ErrBadCast, typ)
 }
+
 func (b BinaryLiteral) Equals(other Literal) bool {
 	rhs, ok := other.(BinaryLiteral)
 	if !ok {
@@ -929,12 +1007,14 @@ func (b BinaryLiteral) Equals(other Literal) bool {
 func (b BinaryLiteral) MarshalBinary() (data []byte, err error) {
 	// stored directly as is
 	data = b
+
 	return
 }
 
 func (b *BinaryLiteral) UnmarshalBinary(data []byte) error {
 	// stored directly as is
 	*b = BinaryLiteral(data)
+
 	return nil
 }
 
@@ -943,6 +1023,7 @@ type FixedLiteral []byte
 func (FixedLiteral) Comparator() Comparator[[]byte] { return bytes.Compare }
 func (f FixedLiteral) Type() Type                   { return FixedTypeOf(len(f)) }
 func (f FixedLiteral) Value() []byte                { return []byte(f) }
+func (f FixedLiteral) Any() any                     { return f.Value() }
 func (f FixedLiteral) String() string               { return string(f) }
 func (f FixedLiteral) To(typ Type) (Literal, error) {
 	switch t := typ.(type) {
@@ -952,6 +1033,7 @@ func (f FixedLiteral) To(typ Type) (Literal, error) {
 			return nil, fmt.Errorf("%w: cannot convert FixedLiteral to UUID - %s",
 				ErrBadCast, err.Error())
 		}
+
 		return UUIDLiteral(val), nil
 	case FixedType:
 		if len(f) == t.len {
@@ -967,6 +1049,7 @@ func (f FixedLiteral) To(typ Type) (Literal, error) {
 	return nil, fmt.Errorf("%w: FixedLiteral[%d] to %s",
 		ErrBadCast, len(f), typ)
 }
+
 func (f FixedLiteral) Equals(other Literal) bool {
 	rhs, ok := other.(FixedLiteral)
 	if !ok {
@@ -979,12 +1062,14 @@ func (f FixedLiteral) Equals(other Literal) bool {
 func (f FixedLiteral) MarshalBinary() (data []byte, err error) {
 	// stored directly as is
 	data = f
+
 	return
 }
 
 func (f *FixedLiteral) UnmarshalBinary(data []byte) error {
 	// stored directly as is
 	*f = FixedLiteral(data)
+
 	return nil
 }
 
@@ -998,6 +1083,7 @@ func (UUIDLiteral) Comparator() Comparator[uuid.UUID] {
 
 func (UUIDLiteral) Type() Type         { return PrimitiveTypes.UUID }
 func (u UUIDLiteral) Value() uuid.UUID { return uuid.UUID(u) }
+func (u UUIDLiteral) Any() any         { return u.Value() }
 func (u UUIDLiteral) String() string   { return uuid.UUID(u).String() }
 func (u UUIDLiteral) To(typ Type) (Literal, error) {
 	switch t := typ.(type) {
@@ -1006,6 +1092,7 @@ func (u UUIDLiteral) To(typ Type) (Literal, error) {
 	case FixedType:
 		if len(u) == t.len {
 			v, _ := uuid.UUID(u).MarshalBinary()
+
 			return FixedLiteral(v), nil
 		}
 
@@ -1013,11 +1100,13 @@ func (u UUIDLiteral) To(typ Type) (Literal, error) {
 			ErrBadCast, typ, len(u), t.len)
 	case BinaryType:
 		v, _ := uuid.UUID(u).MarshalBinary()
+
 		return BinaryLiteral(v), nil
 	}
 
 	return nil, fmt.Errorf("%w: UUIDLiteral to %s", ErrBadCast, typ)
 }
+
 func (u UUIDLiteral) Equals(other Literal) bool {
 	rhs, ok := other.(UUIDLiteral)
 	if !ok {
@@ -1038,6 +1127,7 @@ func (u *UUIDLiteral) UnmarshalBinary(data []byte) error {
 		return err
 	}
 	*u = UUIDLiteral(out)
+
 	return nil
 }
 
@@ -1059,6 +1149,7 @@ func (DecimalLiteral) Comparator() Comparator[Decimal] {
 }
 func (d DecimalLiteral) Type() Type     { return DecimalTypeOf(9, d.Scale) }
 func (d DecimalLiteral) Value() Decimal { return Decimal(d) }
+func (d DecimalLiteral) Any() any       { return d.Value() }
 func (d DecimalLiteral) String() string {
 	return d.Val.ToString(int32(d.Scale))
 }
@@ -1118,16 +1209,19 @@ func (d DecimalLiteral) Equals(other Literal) bool {
 	if err != nil {
 		return false
 	}
+
 	return d.Val == rescaled
 }
 
 func (d DecimalLiteral) Increment() Literal {
 	d.Val = d.Val.Add(decimal128.FromU64(1))
+
 	return d
 }
 
 func (d DecimalLiteral) Decrement() Literal {
 	d.Val = d.Val.Sub(decimal128.FromU64(1))
+
 	return d
 }
 
@@ -1135,8 +1229,9 @@ func (d DecimalLiteral) MarshalBinary() (data []byte, err error) {
 	// stored as unscaled value in two's compliment big-endian values
 	// using the minimum number of bytes for the values
 	n := decimal128.Num(d.Val).BigInt()
+	minBytes := (n.BitLen() + 8) / 8
 	// bytes gives absolute value as big-endian bytes
-	data = n.Bytes()
+	data = n.FillBytes(make([]byte, minBytes))
 	if n.Sign() < 0 {
 		// convert to 2's complement for negative value
 		for i, v := range data {
@@ -1144,6 +1239,7 @@ func (d DecimalLiteral) MarshalBinary() (data []byte, err error) {
 		}
 		data[len(data)-1] += 1
 	}
+
 	return
 }
 
@@ -1152,12 +1248,14 @@ func (d *DecimalLiteral) UnmarshalBinary(data []byte) error {
 	// big-endian values using the minimum number of bytes
 	if len(data) == 0 {
 		d.Val = decimal128.Num{}
+
 		return nil
 	}
 
 	if int8(data[0]) >= 0 {
 		// not negative
 		d.Val = decimal128.FromBigInt((&big.Int{}).SetBytes(data))
+
 		return nil
 	}
 
@@ -1170,5 +1268,6 @@ func (d *DecimalLiteral) UnmarshalBinary(data []byte) error {
 
 	value := (&big.Int{}).SetBytes(out)
 	d.Val = decimal128.FromBigInt(value.Neg(value))
+
 	return nil
 }

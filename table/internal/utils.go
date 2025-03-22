@@ -17,7 +17,14 @@
 
 package internal
 
-import "container/heap"
+import (
+	"container/heap"
+	"encoding/binary"
+	"fmt"
+
+	"github.com/apache/arrow-go/v18/arrow/decimal"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
+)
 
 // Enumerated is a quick way to represent a sequenced value that can
 // be processed in parallel and then needs to be reordered.
@@ -37,6 +44,7 @@ func (pq *pqueue[T]) Len() int { return len(pq.queue) }
 func (pq *pqueue[T]) Less(i, j int) bool {
 	return pq.compare(pq.queue[i], pq.queue[j])
 }
+
 func (pq *pqueue[T]) Swap(i, j int) {
 	pq.queue[i], pq.queue[j] = pq.queue[j], pq.queue[i]
 }
@@ -52,6 +60,7 @@ func (pq *pqueue[T]) Pop() any {
 	item := old[n-1]
 	old[n-1] = nil
 	pq.queue = old[0 : n-1]
+
 	return item
 }
 
@@ -72,5 +81,61 @@ func MakeSequencedChan[T any](bufferSize uint, source <-chan T, comesAfter, isNe
 			}
 		}
 	}()
+
 	return out
+}
+
+func u64FromBigEndianShifted(buf []byte) uint64 {
+	var bytes [8]byte
+	copy(bytes[8-len(buf):], buf)
+
+	return binary.BigEndian.Uint64(bytes[:])
+}
+
+func BigEndianToDecimal(buf []byte) (decimal.Decimal128, error) {
+	const (
+		minDecBytes = 1
+		maxDecBytes = 16
+	)
+
+	if len(buf) < minDecBytes || len(buf) > maxDecBytes {
+		return decimal.Decimal128{},
+			fmt.Errorf("invalid length for conversion to decimal: %d, must be between %d and %d",
+				len(buf), minDecBytes, maxDecBytes)
+	}
+
+	// big endian, so first byte is the MSB and host the sign bit
+	isNeg := int8(buf[0]) < 0
+
+	var hi, lo int64
+	// step 1. extract high bits
+	highBitsOffset := max(0, len(buf)-8)
+	highBits := u64FromBigEndianShifted(buf[:highBitsOffset])
+
+	if highBitsOffset == 8 {
+		hi = int64(highBits)
+	} else {
+		if isNeg && len(buf) < maxDecBytes {
+			hi = -1
+		}
+
+		hi = int64(uint64(hi) << (uint64(highBitsOffset) * 8))
+		hi |= int64(highBits)
+	}
+
+	// step 2. extract low bits
+	lowBitsOffset := min(len(buf), 8)
+	lowBits := u64FromBigEndianShifted(buf[highBitsOffset:])
+	if lowBitsOffset == 8 {
+		lo = int64(lowBits)
+	} else {
+		if isNeg && len(buf) < 8 {
+			lo = -1
+		}
+
+		lo = int64(uint64(lo) << (uint64(lowBitsOffset) * 8))
+		lo |= int64(lowBits)
+	}
+
+	return decimal128.New(hi, uint64(lo)), nil
 }

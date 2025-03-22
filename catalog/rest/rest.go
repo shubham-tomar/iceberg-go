@@ -45,9 +45,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 )
 
-var (
-	_ catalog.Catalog = (*Catalog)(nil)
-)
+var _ catalog.Catalog = (*Catalog)(nil)
 
 const (
 	pageSizeKey contextKey = "page_size"
@@ -129,6 +127,7 @@ func (t *commitTableResponse) UnmarshalJSON(b []byte) (err error) {
 	}
 
 	t.Metadata, err = table.ParseMetadataBytes(t.RawMetadata)
+
 	return
 }
 
@@ -146,6 +145,7 @@ func (t *loadTableResponse) UnmarshalJSON(b []byte) (err error) {
 	}
 
 	t.Metadata, err = table.ParseMetadataBytes(t.RawMetadata)
+
 	return
 }
 
@@ -183,6 +183,7 @@ func (o oauthErrorResponse) Error() string {
 	if o.ErrURI != "" {
 		msg += " (" + o.ErrURI + ")"
 	}
+
 	return msg
 }
 
@@ -268,7 +269,7 @@ func do[T any](ctx context.Context, method string, baseURI *url.URL, path []stri
 		return ret, handleNon200(rsp, override)
 	}
 
-	if method == http.MethodHead {
+	if method == http.MethodHead || method == http.MethodDelete {
 		return
 	}
 
@@ -290,6 +291,7 @@ func doDelete[T any](ctx context.Context, baseURI *url.URL, path []string, cl *h
 
 func doHead(ctx context.Context, baseURI *url.URL, path []string, cl *http.Client, override map[int]error) error {
 	_, err := do[struct{}](ctx, http.MethodHead, baseURI, path, cl, override, true)
+
 	return err
 }
 
@@ -343,6 +345,7 @@ func handleNon200(rsp *http.Response, override map[int]error) error {
 	if override != nil {
 		if err, ok := override[rsp.StatusCode]; ok {
 			e.wrapping = err
+
 			return e
 		}
 	}
@@ -374,7 +377,9 @@ func handleNon200(rsp *http.Response, override map[int]error) error {
 }
 
 func fromProps(props iceberg.Properties) *options {
-	o := &options{}
+	o := &options{
+		additionalProps: iceberg.Properties{},
+	}
 	for k, v := range props {
 		switch k {
 		case keyOauthToken:
@@ -408,13 +413,24 @@ func fromProps(props iceberg.Properties) *options {
 			} else {
 				o.tlsConfig.InsecureSkipVerify = verify
 			}
+		case "uri", "type":
+		default:
+			if v != "" {
+				o.additionalProps[k] = v
+			}
 		}
 	}
+
 	return o
 }
 
 func toProps(o *options) iceberg.Properties {
-	props := iceberg.Properties{}
+	var props iceberg.Properties
+	if o.additionalProps != nil {
+		props = o.additionalProps
+	} else {
+		props = iceberg.Properties{}
+	}
 
 	setIf := func(key, v string) {
 		if v != "" {
@@ -436,6 +452,7 @@ func toProps(o *options) iceberg.Properties {
 	if o.authUri != nil {
 		setIf(keyAuthUrl, o.authUri.String())
 	}
+
 	return props
 }
 
@@ -487,6 +504,7 @@ func (r *Catalog) init(ctx context.Context, ops *options, uri string) error {
 		r.baseURI = r.baseURI.JoinPath(ops.prefix)
 	}
 	r.props = toProps(ops)
+
 	return nil
 }
 
@@ -632,44 +650,74 @@ func checkValidNamespace(ident table.Identifier) error {
 	if len(ident) < 1 {
 		return fmt.Errorf("%w: empty namespace identifier", catalog.ErrNoSuchNamespace)
 	}
+
 	return nil
 }
 
 func (r *Catalog) tableFromResponse(ctx context.Context, identifier []string, metadata table.Metadata, loc string, config iceberg.Properties) (*table.Table, error) {
-	id := identifier
-	if r.name != "" {
-		id = append([]string{r.name}, identifier...)
-	}
-
 	iofs, err := iceio.LoadFS(ctx, config, loc)
 	if err != nil {
 		return nil, err
 	}
 
-	return table.New(id, metadata, loc, iofs), nil
+	return table.New(identifier, metadata, loc, iofs, r), nil
 }
 
-func (r *Catalog) ListTables(ctx context.Context, namespace table.Identifier) ([]table.Identifier, error) {
+func (r *Catalog) ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
+	return func(yield func(table.Identifier, error) bool) {
+		pageSize := r.getPageSize(ctx)
+		var pageToken string
+
+		for {
+			tables, nextPageToken, err := r.listTablesPage(ctx, namespace, pageToken, pageSize)
+			if err != nil {
+				yield(table.Identifier{}, err)
+
+				return
+			}
+			for _, tbl := range tables {
+				if !yield(tbl, nil) {
+					return
+				}
+			}
+			if nextPageToken == "" {
+				return
+			}
+			pageToken = nextPageToken
+		}
+	}
+}
+
+func (r *Catalog) listTablesPage(ctx context.Context, namespace table.Identifier, pageToken string, pageSize int) ([]table.Identifier, string, error) {
 	if err := checkValidNamespace(namespace); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-
 	ns := strings.Join(namespace, namespaceSeparator)
-	path := []string{"namespaces", ns, "tables"}
+	uri := r.baseURI.JoinPath("namespaces", ns, "tables")
 
+	v := url.Values{}
+	if pageSize >= 0 {
+		v.Set("page-size", strconv.Itoa(pageSize))
+	}
+	if pageToken != "" {
+		v.Set("page-token", pageToken)
+	}
+
+	uri.RawQuery = v.Encode()
 	type resp struct {
-		Identifiers []identifier `json:"identifiers"`
+		Identifiers   []identifier `json:"identifiers"`
+		NextPageToken string       `json:"next-page-token,omitempty"`
 	}
-	rsp, err := doGet[resp](ctx, r.baseURI, path, r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchNamespace})
+	rsp, err := doGet[resp](ctx, uri, []string{}, r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchNamespace})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-
 	out := make([]table.Identifier, len(rsp.Identifiers))
 	for i, id := range rsp.Identifiers {
 		out[i] = append(id.Namespace, id.Name)
 	}
-	return out, nil
+
+	return out, rsp.NextPageToken, nil
 }
 
 func splitIdentForPath(ident table.Identifier) (string, string, error) {
@@ -758,6 +806,7 @@ func (r *Catalog) CommitTable(ctx context.Context, tbl *table.Table, requirement
 
 	config := maps.Clone(r.props)
 	maps.Copy(config, ret.Metadata.Properties())
+
 	return ret.Metadata, ret.MetadataLoc, nil
 }
 
@@ -774,7 +823,8 @@ func (r *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 
 	ret, err := doPost[payload, loadTableResponse](ctx, r.baseURI, []string{"namespaces", ns, "tables", tbl},
 		payload{Name: tbl, MetadataLoc: metadataLoc}, r.cl, map[int]error{
-			http.StatusNotFound: catalog.ErrNoSuchNamespace, http.StatusConflict: catalog.ErrTableAlreadyExists})
+			http.StatusNotFound: catalog.ErrNoSuchNamespace, http.StatusConflict: catalog.ErrTableAlreadyExists,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -782,6 +832,7 @@ func (r *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 	config := maps.Clone(r.props)
 	maps.Copy(config, ret.Metadata.Properties())
 	maps.Copy(config, ret.Config)
+
 	return r.tableFromResponse(ctx, identifier, ret.Metadata, ret.MetadataLoc, config)
 }
 
@@ -894,7 +945,9 @@ func (r *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifie
 
 	_, err := doPost[map[string]any, struct{}](ctx, r.baseURI, []string{"namespaces"},
 		map[string]any{"namespace": namespace, "properties": props}, r.cl, map[int]error{
-			http.StatusNotFound: catalog.ErrNoSuchNamespace, http.StatusConflict: catalog.ErrNamespaceAlreadyExists})
+			http.StatusNotFound: catalog.ErrNoSuchNamespace, http.StatusConflict: catalog.ErrNamespaceAlreadyExists,
+		})
+
 	return err
 }
 
@@ -949,8 +1002,8 @@ func (r *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.I
 }
 
 func (r *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table.Identifier,
-	removals []string, updates iceberg.Properties) (catalog.PropertiesUpdateSummary, error) {
-
+	removals []string, updates iceberg.Properties,
+) (catalog.PropertiesUpdateSummary, error) {
 	if err := checkValidNamespace(namespace); err != nil {
 		return catalog.PropertiesUpdateSummary{}, err
 	}
@@ -961,6 +1014,7 @@ func (r *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 	}
 
 	ns := strings.Join(namespace, namespaceSeparator)
+
 	return doPost[payload, catalog.PropertiesUpdateSummary](ctx, r.baseURI, []string{"namespaces", ns, "properties"},
 		payload{Remove: removals, Updates: updates}, r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchNamespace})
 }
@@ -976,6 +1030,7 @@ func (r *Catalog) CheckNamespaceExists(ctx context.Context, namespace table.Iden
 		if errors.Is(err, catalog.ErrNoSuchNamespace) {
 			return false, nil
 		}
+
 		return false, err
 	}
 
@@ -993,8 +1048,10 @@ func (r *Catalog) CheckTableExists(ctx context.Context, identifier table.Identif
 		if errors.Is(err, catalog.ErrNoSuchTable) {
 			return false, nil
 		}
+
 		return false, err
 	}
+
 	return true, nil
 }
 
@@ -1007,6 +1064,7 @@ func (r *Catalog) ListViews(ctx context.Context, namespace table.Identifier) ite
 			views, nextPageToken, err := r.listViewsPage(ctx, namespace, pageToken, pageSize)
 			if err != nil {
 				yield(table.Identifier{}, err)
+
 				return
 			}
 			for _, view := range views {
@@ -1052,6 +1110,7 @@ func (r *Catalog) listViewsPage(ctx context.Context, namespace table.Identifier,
 	for i, id := range rsp.Identifiers {
 		out[i] = append(id.Namespace, id.Name)
 	}
+
 	return out, rsp.NextPageToken, nil
 }
 
@@ -1059,6 +1118,7 @@ func (r *Catalog) getPageSize(ctx context.Context) int {
 	if pageSize, ok := ctx.Value(pageSizeKey).(int); ok {
 		return pageSize
 	}
+
 	return defaultPageSize
 }
 
@@ -1074,6 +1134,7 @@ func (r *Catalog) DropView(ctx context.Context, identifier table.Identifier) err
 
 	_, err = doDelete[struct{}](ctx, r.baseURI, []string{"namespaces", ns, "views", view}, r.cl,
 		map[int]error{http.StatusNotFound: catalog.ErrNoSuchView})
+
 	return err
 }
 
@@ -1089,7 +1150,9 @@ func (r *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifi
 		if errors.Is(err, catalog.ErrNoSuchView) {
 			return false, nil
 		}
+
 		return false, err
 	}
+
 	return true, nil
 }

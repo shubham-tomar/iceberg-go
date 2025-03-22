@@ -22,71 +22,82 @@ import (
 	"database/sql"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/internal"
 	sqlcat "github.com/apache/iceberg-go/catalog/sql"
 	"github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/uptrace/bun/driver/sqliteshim"
-	"golang.org/x/exp/rand"
 )
 
-var (
-	tableSchemaNested = iceberg.NewSchemaWithIdentifiers(1,
-		[]int{1},
-		iceberg.NestedField{
-			ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: false},
-		iceberg.NestedField{
-			ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
-		iceberg.NestedField{
-			ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false},
-		iceberg.NestedField{
-			ID: 4, Name: "qux", Required: true, Type: &iceberg.ListType{
-				ElementID: 5, Element: iceberg.PrimitiveTypes.String, ElementRequired: true}},
-		iceberg.NestedField{
-			ID: 6, Name: "quux",
-			Type: &iceberg.MapType{
-				KeyID:   7,
-				KeyType: iceberg.PrimitiveTypes.String,
-				ValueID: 8,
-				ValueType: &iceberg.MapType{
-					KeyID:         9,
-					KeyType:       iceberg.PrimitiveTypes.String,
-					ValueID:       10,
-					ValueType:     iceberg.PrimitiveTypes.Int32,
-					ValueRequired: true,
-				},
+var tableSchemaNested = iceberg.NewSchemaWithIdentifiers(1,
+	[]int{1},
+	iceberg.NestedField{
+		ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: false,
+	},
+	iceberg.NestedField{
+		ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+	},
+	iceberg.NestedField{
+		ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false,
+	},
+	iceberg.NestedField{
+		ID: 4, Name: "qux", Required: true, Type: &iceberg.ListType{
+			ElementID: 5, Element: iceberg.PrimitiveTypes.String, ElementRequired: true,
+		},
+	},
+	iceberg.NestedField{
+		ID: 6, Name: "quux",
+		Type: &iceberg.MapType{
+			KeyID:   7,
+			KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 8,
+			ValueType: &iceberg.MapType{
+				KeyID:         9,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       10,
+				ValueType:     iceberg.PrimitiveTypes.Int32,
 				ValueRequired: true,
 			},
-			Required: true},
-		iceberg.NestedField{
-			ID: 11, Name: "location", Type: &iceberg.ListType{
-				ElementID: 12, Element: &iceberg.StructType{
-					FieldList: []iceberg.NestedField{
-						{ID: 13, Name: "latitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
-						{ID: 14, Name: "longitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
-					},
-				},
-				ElementRequired: true},
-			Required: true},
-		iceberg.NestedField{
-			ID:   15,
-			Name: "person",
-			Type: &iceberg.StructType{
+			ValueRequired: true,
+		},
+		Required: true,
+	},
+	iceberg.NestedField{
+		ID: 11, Name: "location", Type: &iceberg.ListType{
+			ElementID: 12, Element: &iceberg.StructType{
 				FieldList: []iceberg.NestedField{
-					{ID: 16, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
-					{ID: 17, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+					{ID: 13, Name: "latitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+					{ID: 14, Name: "longitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
 				},
 			},
-			Required: false,
+			ElementRequired: true,
 		},
-	)
+		Required: true,
+	},
+	iceberg.NestedField{
+		ID:   15,
+		Name: "person",
+		Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 16, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+				{ID: 17, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+			},
+		},
+		Required: false,
+	},
 )
 
 func TestCreateSQLCatalogNoDriverDialect(t *testing.T) {
@@ -110,8 +121,9 @@ func randomString(n int) string {
 	var b strings.Builder
 	b.Grow(n)
 	for range n {
-		b.WriteByte(letters[rand.Intn(len(letters))])
+		b.WriteByte(letters[rand.IntN(len(letters))])
 	}
+
 	return b.String()
 }
 
@@ -129,6 +141,7 @@ func hiearchicalNamespaceName() string {
 	prefix := "my-iceberg-ns-"
 	tag1 := randomString(randomLen)
 	tag2 := randomString(randomLen)
+
 	return strings.Join([]string{prefix + tag1, prefix + tag2}, ".")
 }
 
@@ -140,13 +153,15 @@ type SqliteCatalogTestSuite struct {
 
 func (s *SqliteCatalogTestSuite) randomTableIdentifier() table.Identifier {
 	dbname, tablename := databaseName(), tableName()
-	s.Require().NoError(os.MkdirAll(filepath.Join(s.warehouse, dbname+".db", tablename, "metadata"), 0755))
+	s.Require().NoError(os.MkdirAll(filepath.Join(s.warehouse, dbname+".db", tablename, "metadata"), 0o755))
+
 	return table.Identifier{dbname, tablename}
 }
 
 func (s *SqliteCatalogTestSuite) randomHierarchicalIdentifier() table.Identifier {
 	hierarchicalNsName, tableName := hiearchicalNamespaceName(), tableName()
-	s.Require().NoError(os.MkdirAll(filepath.Join(s.warehouse, hierarchicalNsName+".db", tableName, "metadata"), 0755))
+	s.Require().NoError(os.MkdirAll(filepath.Join(s.warehouse, hierarchicalNsName+".db", tableName, "metadata"), 0o755))
+
 	return strings.Split(hierarchicalNsName+"."+tableName, ".")
 }
 
@@ -486,18 +501,41 @@ func (s *SqliteCatalogTestSuite) TestListTables() {
 		_, err = cat.CreateTable(ctx, tbl2, tableSchemaNested)
 		s.Require().NoError(err)
 
-		tables, err := cat.ListTables(ctx, ns1)
-		s.Require().NoError(err)
+		var lastErr error
+		tables := make([]table.Identifier, 0)
+		iter := cat.ListTables(ctx, ns1)
+		for tbl, err := range iter {
+			tables = append(tables, tbl)
+			if err != nil {
+				lastErr = err
+			}
+		}
+
+		s.Require().NoError(lastErr)
 		s.Len(tables, 1)
 		s.Equal(tbl1, tables[0])
 
-		tables, err = cat.ListTables(ctx, ns2)
-		s.Require().NoError(err)
-		s.Len(tables, 1)
-		s.Equal(tbl2, tables[0])
+		tables2 := make([]table.Identifier, 0)
+		iter = cat.ListTables(ctx, ns2)
+		for tbl, err := range iter {
+			tables2 = append(tables2, tbl)
+			if err != nil {
+				lastErr = err
+			}
+		}
+		s.Require().NoError(lastErr)
+		s.Len(tables2, 1)
+		s.Equal(tbl2, tables2[0])
 
-		_, err = cat.ListTables(ctx, table.Identifier{"does_not_exist"})
-		s.ErrorIs(err, catalog.ErrNoSuchNamespace)
+		table3 := make([]table.Identifier, 0)
+		iter = cat.ListTables(ctx, table.Identifier{"does_not_exist"})
+		for tbl, err := range iter {
+			table3 = append(table3, tbl)
+			if err != nil {
+				lastErr = err
+			}
+		}
+		s.ErrorIs(lastErr, catalog.ErrNoSuchNamespace)
 	}
 }
 
@@ -937,6 +975,69 @@ func (s *SqliteCatalogTestSuite) TestUpdateNamespaceProperties() {
 			"test_property4": "4",
 			"test_property5": "5",
 		}, props)
+	}
+}
+
+func (s *SqliteCatalogTestSuite) TestCommitTable() {
+	tests := []struct {
+		cat   *sqlcat.Catalog
+		tblID table.Identifier
+	}{
+		{s.getCatalogMemory(), s.randomTableIdentifier()},
+		{s.getCatalogSqlite(), s.randomHierarchicalIdentifier()},
+	}
+
+	arrSchema, err := table.SchemaToArrowSchema(tableSchemaNested, nil, false, false)
+	s.Require().NoError(err)
+
+	table, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema,
+		[]string{`[
+		{
+			"foo": "foo_string",
+			"bar": 123,
+			"baz": true,
+			"qux": ["a", "b", "c"],
+			"quux": [{"key": "gopher", "value": [
+				{"key": "golang", "value": "1337"}]}],
+			"location": [{"latitude": 37.7749, "longitude": -122.4194}],
+			"person": {"name": "gopher", "age": 10}
+		}
+	]`})
+	s.Require().NoError(err)
+	defer table.Release()
+
+	pqfile := filepath.Join(s.warehouse, "test_commit_table_data", "test.parquet")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(pqfile), 0o777))
+	f, err := os.Create(pqfile)
+	s.Require().NoError(err)
+
+	s.Require().NoError(pqarrow.WriteTable(table, f, table.NumRows(),
+		nil, pqarrow.DefaultWriterProps()))
+
+	ctx := context.Background()
+	for _, tt := range tests {
+		ns := catalog.NamespaceFromIdent(tt.tblID)
+		s.Require().NoError(tt.cat.CreateNamespace(ctx, ns, nil))
+
+		tbl, err := tt.cat.CreateTable(ctx, tt.tblID, tableSchemaNested)
+		s.Require().NoError(err)
+		originalMetadataLocation := tbl.MetadataLocation()
+		originalLastUpdated := tbl.Metadata().LastUpdatedMillis()
+
+		s.EqualValues(0, internal.ParseMetadataVersion(tbl.MetadataLocation()))
+		s.EqualValues(0, tbl.Metadata().CurrentSchema().ID)
+
+		tx := tbl.NewTransaction()
+		s.Require().NoError(tx.AddFiles([]string{pqfile}, nil, false))
+		updated, err := tx.Commit(ctx)
+		s.Require().NoError(err)
+
+		s.EqualValues(1, internal.ParseMetadataVersion(updated.MetadataLocation()))
+		s.Greater(updated.Metadata().LastUpdatedMillis(), originalLastUpdated)
+		logs := slices.Collect(updated.Metadata().PreviousFiles())
+		s.Len(logs, 1)
+		s.Equal(originalMetadataLocation, logs[0].MetadataFile)
+		s.Equal(originalLastUpdated, logs[0].TimestampMs)
 	}
 }
 

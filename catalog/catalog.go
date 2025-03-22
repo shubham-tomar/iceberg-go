@@ -31,11 +31,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
 	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog/internal"
+	iceinternal "github.com/apache/iceberg-go/internal"
 	"github.com/apache/iceberg-go/table"
 )
 
@@ -79,7 +81,7 @@ type Catalog interface {
 	CommitTable(context.Context, *table.Table, []table.Requirement, []table.Update) (table.Metadata, string, error)
 	// ListTables returns a list of table identifiers in the catalog, with the returned
 	// identifiers containing the information required to load the table via that catalog.
-	ListTables(ctx context.Context, namespace table.Identifier) ([]table.Identifier, error)
+	ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error]
 	// LoadTable loads a table from the catalog and returns a Table with the metadata.
 	LoadTable(ctx context.Context, identifier table.Identifier, props iceberg.Properties) (*table.Table, error)
 	// DropTable tells the catalog to drop the table entirely.
@@ -107,6 +109,7 @@ func ToIdentifier(ident ...string) table.Identifier {
 		if ident[0] == "" {
 			return nil
 		}
+
 		return table.Identifier(strings.Split(ident[0], "."))
 	}
 
@@ -162,6 +165,7 @@ func checkForOverlap(removals []string, updates iceberg.Properties) error {
 	if len(overlap) > 0 {
 		return fmt.Errorf("conflict between removals and updates for keys: %v", overlap)
 	}
+
 	return nil
 }
 
@@ -193,7 +197,8 @@ func getUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals [
 	summary := PropertiesUpdateSummary{
 		Removed: removed,
 		Updated: updated,
-		Missing: iceberg.Difference(removals, removed),
+		Missing: iceinternal.Difference(removals, removed),
 	}
+
 	return updatedProps, summary, nil
 }

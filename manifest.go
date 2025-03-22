@@ -18,13 +18,20 @@
 package iceberg
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"reflect"
+	"slices"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/google/uuid"
 
 	"github.com/hamba/avro/v2"
 	"github.com/hamba/avro/v2/ocf"
@@ -40,6 +47,19 @@ const (
 	ManifestContentDeletes ManifestContent = 1
 )
 
+func (m ManifestContent) String() string {
+	switch m {
+	case ManifestContentData:
+		return "data"
+	case ManifestContentDeletes:
+		return "deletes"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+const initialSequenceNumber = 0
+
 type FieldSummary struct {
 	ContainsNull bool    `avro:"contains_null"`
 	ContainsNaN  *bool   `avro:"contains_nan"`
@@ -47,71 +67,91 @@ type FieldSummary struct {
 	UpperBound   *[]byte `avro:"upper_bound"`
 }
 
-// ManifestV1Builder is a helper for building a V1 manifest file
-// struct which will conform to the ManifestFile interface.
-type ManifestV1Builder struct {
-	m *manifestFileV1
+type ManifestBuilder struct {
+	m *manifestFile
 }
 
-// NewManifestV1Builder is passed all of the required fields and then allows
-// all of the optional fields to be set by calling the corresponding methods
-// before calling [ManifestV1Builder.Build] to construct the object.
-func NewManifestV1Builder(path string, length int64, partitionSpecID int32, addedSnapshotID int64) *ManifestV1Builder {
-	return &ManifestV1Builder{
-		m: &manifestFileV1{
+func NewManifestFile(version int, path string, length int64, partitionSpecID int32, addedSnapshotID int64) *ManifestBuilder {
+	var seqNum int64
+	if version != 1 {
+		seqNum = -1
+	}
+
+	return &ManifestBuilder{
+		m: &manifestFile{
+			version:         version,
 			Path:            path,
 			Len:             length,
 			SpecID:          partitionSpecID,
 			AddedSnapshotID: addedSnapshotID,
+			Content:         ManifestContentData,
+			SeqNumber:       seqNum,
+			MinSeqNumber:    seqNum,
 		},
 	}
 }
 
-func (b *ManifestV1Builder) AddedFiles(cnt int32) *ManifestV1Builder {
-	b.m.AddedFilesCount = &cnt
+func (b *ManifestBuilder) SequenceNum(num, minSeqNum int64) *ManifestBuilder {
+	b.m.SeqNumber, b.m.MinSeqNumber = num, minSeqNum
+
 	return b
 }
 
-func (b *ManifestV1Builder) ExistingFiles(cnt int32) *ManifestV1Builder {
-	b.m.ExistingFilesCount = &cnt
+func (b *ManifestBuilder) Content(content ManifestContent) *ManifestBuilder {
+	b.m.Content = content
+
 	return b
 }
 
-func (b *ManifestV1Builder) DeletedFiles(cnt int32) *ManifestV1Builder {
-	b.m.DeletedFilesCount = &cnt
+func (b *ManifestBuilder) AddedFiles(cnt int32) *ManifestBuilder {
+	b.m.AddedFilesCount = cnt
+
 	return b
 }
 
-func (b *ManifestV1Builder) AddedRows(cnt int64) *ManifestV1Builder {
-	b.m.AddedRowsCount = &cnt
+func (b *ManifestBuilder) ExistingFiles(cnt int32) *ManifestBuilder {
+	b.m.ExistingFilesCount = cnt
+
 	return b
 }
 
-func (b *ManifestV1Builder) ExistingRows(cnt int64) *ManifestV1Builder {
-	b.m.ExistingRowsCount = &cnt
+func (b *ManifestBuilder) DeletedFiles(cnt int32) *ManifestBuilder {
+	b.m.DeletedFilesCount = cnt
+
 	return b
 }
 
-func (b *ManifestV1Builder) DeletedRows(cnt int64) *ManifestV1Builder {
-	b.m.DeletedRowsCount = &cnt
+func (b *ManifestBuilder) AddedRows(cnt int64) *ManifestBuilder {
+	b.m.AddedRowsCount = cnt
+
 	return b
 }
 
-func (b *ManifestV1Builder) Partitions(p []FieldSummary) *ManifestV1Builder {
+func (b *ManifestBuilder) ExistingRows(cnt int64) *ManifestBuilder {
+	b.m.ExistingRowsCount = cnt
+
+	return b
+}
+
+func (b *ManifestBuilder) DeletedRows(cnt int64) *ManifestBuilder {
+	b.m.DeletedRowsCount = cnt
+
+	return b
+}
+
+func (b *ManifestBuilder) Partitions(p []FieldSummary) *ManifestBuilder {
 	b.m.PartitionList = &p
+
 	return b
 }
 
-func (b *ManifestV1Builder) KeyMetadata(km []byte) *ManifestV1Builder {
+func (b *ManifestBuilder) KeyMetadata(km []byte) *ManifestBuilder {
 	b.m.Key = km
+
 	return b
 }
 
-// Build returns the constructed manifest file, after calling Build this
-// builder should not be used further as we avoid copying by just returning
-// a pointer to the constructed manifest file. Further calls to the modifier
-// methods after calling build would modify the constructed ManifestFile.
-func (b *ManifestV1Builder) Build() ManifestFile {
+func (b *ManifestBuilder) Build() ManifestFile {
 	return b.m
 }
 
@@ -120,24 +160,66 @@ type fallbackManifestFileV1 struct {
 	AddedSnapshotID *int64 `avro:"added_snapshot_id"`
 }
 
-func (f *fallbackManifestFileV1) toManifest() *manifestFileV1 {
-	f.manifestFileV1.AddedSnapshotID = *f.AddedSnapshotID
-	return &f.manifestFileV1
+func (f *fallbackManifestFileV1) toFile() *manifestFile {
+	if f.AddedSnapshotID == nil {
+		f.manifestFileV1.AddedSnapshotID = -1
+	}
+
+	return f.manifestFileV1.toFile()
 }
 
 type manifestFileV1 struct {
-	Path               string          `avro:"manifest_path"`
-	Len                int64           `avro:"manifest_length"`
-	SpecID             int32           `avro:"partition_spec_id"`
-	AddedSnapshotID    int64           `avro:"added_snapshot_id"`
-	AddedFilesCount    *int32          `avro:"added_data_files_count"`
-	ExistingFilesCount *int32          `avro:"existing_data_files_count"`
-	DeletedFilesCount  *int32          `avro:"deleted_data_files_count"`
-	AddedRowsCount     *int64          `avro:"added_rows_count"`
-	ExistingRowsCount  *int64          `avro:"existing_rows_count"`
-	DeletedRowsCount   *int64          `avro:"deleted_rows_count"`
-	PartitionList      *[]FieldSummary `avro:"partitions"`
-	Key                []byte          `avro:"key_metadata"`
+	manifestFile
+	AddedFilesCount    *int32 `avro:"added_files_count"`
+	ExistingFilesCount *int32 `avro:"existing_files_count"`
+	DeletedFilesCount  *int32 `avro:"deleted_files_count"`
+	AddedRowsCount     *int64 `avro:"added_rows_count"`
+	ExistingRowsCount  *int64 `avro:"existing_rows_count"`
+	DeletedRowsCount   *int64 `avro:"deleted_rows_count"`
+}
+
+func (m *manifestFileV1) toFile() *manifestFile {
+	m.manifestFile.version = 1
+	m.Content = ManifestContentData
+	m.SeqNumber, m.MinSeqNumber = initialSequenceNumber, initialSequenceNumber
+
+	if m.AddedFilesCount != nil {
+		m.manifestFile.AddedFilesCount = *m.AddedFilesCount
+	} else {
+		m.manifestFile.AddedFilesCount = -1
+	}
+
+	if m.ExistingFilesCount != nil {
+		m.manifestFile.ExistingFilesCount = *m.ExistingFilesCount
+	} else {
+		m.manifestFile.ExistingFilesCount = -1
+	}
+
+	if m.DeletedFilesCount != nil {
+		m.manifestFile.DeletedFilesCount = *m.DeletedFilesCount
+	} else {
+		m.manifestFile.DeletedFilesCount = -1
+	}
+
+	if m.AddedRowsCount != nil {
+		m.manifestFile.AddedRowsCount = *m.AddedRowsCount
+	} else {
+		m.manifestFile.AddedRowsCount = -1
+	}
+
+	if m.ExistingRowsCount != nil {
+		m.manifestFile.ExistingRowsCount = *m.ExistingRowsCount
+	} else {
+		m.manifestFile.ExistingRowsCount = -1
+	}
+
+	if m.DeletedRowsCount != nil {
+		m.manifestFile.DeletedRowsCount = *m.DeletedRowsCount
+	} else {
+		m.manifestFile.DeletedRowsCount = -1
+	}
+
+	return &m.manifestFile
 }
 
 func (*manifestFileV1) Version() int             { return 1 }
@@ -147,6 +229,7 @@ func (m *manifestFileV1) PartitionSpecID() int32 { return m.SpecID }
 func (m *manifestFileV1) ManifestContent() ManifestContent {
 	return ManifestContentData
 }
+
 func (m *manifestFileV1) SnapshotID() int64 {
 	return m.AddedSnapshotID
 }
@@ -155,6 +238,7 @@ func (m *manifestFileV1) AddedDataFiles() int32 {
 	if m.AddedFilesCount == nil {
 		return 0
 	}
+
 	return *m.AddedFilesCount
 }
 
@@ -162,6 +246,7 @@ func (m *manifestFileV1) ExistingDataFiles() int32 {
 	if m.ExistingFilesCount == nil {
 		return 0
 	}
+
 	return *m.ExistingFilesCount
 }
 
@@ -169,6 +254,7 @@ func (m *manifestFileV1) DeletedDataFiles() int32 {
 	if m.DeletedFilesCount == nil {
 		return 0
 	}
+
 	return *m.DeletedFilesCount
 }
 
@@ -176,6 +262,7 @@ func (m *manifestFileV1) AddedRows() int64 {
 	if m.AddedRowsCount == nil {
 		return 0
 	}
+
 	return *m.AddedRowsCount
 }
 
@@ -183,6 +270,7 @@ func (m *manifestFileV1) ExistingRows() int64 {
 	if m.ExistingRowsCount == nil {
 		return 0
 	}
+
 	return *m.ExistingRowsCount
 }
 
@@ -190,6 +278,7 @@ func (m *manifestFileV1) DeletedRows() int64 {
 	if m.DeletedRowsCount == nil {
 		return 0
 	}
+
 	return *m.DeletedRowsCount
 }
 
@@ -208,6 +297,7 @@ func (m *manifestFileV1) Partitions() []FieldSummary {
 	if m.PartitionList == nil {
 		return nil
 	}
+
 	return *m.PartitionList
 }
 
@@ -215,87 +305,7 @@ func (m *manifestFileV1) FetchEntries(fs iceio.IO, discardDeleted bool) ([]Manif
 	return fetchManifestEntries(m, fs, discardDeleted)
 }
 
-// WriteEntries writes a list of manifest entries to an avro file.
-func (m *manifestFileV1) WriteEntries(out io.Writer, entries []ManifestEntry) error {
-	return writeManifestEntries(out, entries, m.Version())
-}
-
-// ManifestV2Builder is a helper for building a V2 manifest file
-// struct which will conform to the ManifestFile interface.
-type ManifestV2Builder struct {
-	m *manifestFileV2
-}
-
-// NewManifestV2Builder is constructed with the primary fields, with the remaining
-// fields set to their zero value unless modified by calling the corresponding
-// methods of the builder. Then calling [ManifestV2Builder.Build] to retrieve the
-// constructed ManifestFile.
-func NewManifestV2Builder(path string, length int64, partitionSpecID int32, content ManifestContent, addedSnapshotID int64) *ManifestV2Builder {
-	return &ManifestV2Builder{
-		m: &manifestFileV2{
-			Path:            path,
-			Len:             length,
-			SpecID:          partitionSpecID,
-			Content:         content,
-			AddedSnapshotID: addedSnapshotID,
-		},
-	}
-}
-
-func (b *ManifestV2Builder) SequenceNum(num, minSeqNum int64) *ManifestV2Builder {
-	b.m.SeqNumber, b.m.MinSeqNumber = num, minSeqNum
-	return b
-}
-
-func (b *ManifestV2Builder) AddedFiles(cnt int32) *ManifestV2Builder {
-	b.m.AddedFilesCount = cnt
-	return b
-}
-
-func (b *ManifestV2Builder) ExistingFiles(cnt int32) *ManifestV2Builder {
-	b.m.ExistingFilesCount = cnt
-	return b
-}
-
-func (b *ManifestV2Builder) DeletedFiles(cnt int32) *ManifestV2Builder {
-	b.m.DeletedFilesCount = cnt
-	return b
-}
-
-func (b *ManifestV2Builder) AddedRows(cnt int64) *ManifestV2Builder {
-	b.m.AddedRowsCount = cnt
-	return b
-}
-
-func (b *ManifestV2Builder) ExistingRows(cnt int64) *ManifestV2Builder {
-	b.m.ExistingRowsCount = cnt
-	return b
-}
-
-func (b *ManifestV2Builder) DeletedRows(cnt int64) *ManifestV2Builder {
-	b.m.DeletedRowsCount = cnt
-	return b
-}
-
-func (b *ManifestV2Builder) Partitions(p []FieldSummary) *ManifestV2Builder {
-	b.m.PartitionList = &p
-	return b
-}
-
-func (b *ManifestV2Builder) KeyMetadata(km []byte) *ManifestV2Builder {
-	b.m.Key = km
-	return b
-}
-
-// Build returns the constructed manifest file, after calling Build this
-// builder should not be used further as we avoid copying by just returning
-// a pointer to the constructed manifest file. Further calls to the modifier
-// methods after calling build would modify the constructed ManifestFile.
-func (b *ManifestV2Builder) Build() ManifestFile {
-	return b.m
-}
-
-type manifestFileV2 struct {
+type manifestFile struct {
 	Path               string          `avro:"manifest_path"`
 	Len                int64           `avro:"manifest_length"`
 	SpecID             int32           `avro:"partition_spec_id"`
@@ -311,68 +321,86 @@ type manifestFileV2 struct {
 	DeletedRowsCount   int64           `avro:"deleted_rows_count"`
 	PartitionList      *[]FieldSummary `avro:"partitions"`
 	Key                []byte          `avro:"key_metadata"`
+
+	version int `avro:"-"`
 }
 
-func (*manifestFileV2) Version() int { return 2 }
-
-func (m *manifestFileV2) FilePath() string                 { return m.Path }
-func (m *manifestFileV2) Length() int64                    { return m.Len }
-func (m *manifestFileV2) PartitionSpecID() int32           { return m.SpecID }
-func (m *manifestFileV2) ManifestContent() ManifestContent { return m.Content }
-func (m *manifestFileV2) SnapshotID() int64 {
-	return m.AddedSnapshotID
+func (m *manifestFile) setVersion(v int) {
+	m.version = v
 }
 
-func (m *manifestFileV2) AddedDataFiles() int32 {
-	return m.AddedFilesCount
+func (m *manifestFile) toV1(v1file *manifestFileV1) {
+	v1file.Path = m.Path
+	v1file.Len = m.Len
+	v1file.SpecID = m.SpecID
+	v1file.AddedSnapshotID = m.AddedSnapshotID
+	v1file.PartitionList = m.PartitionList
+	v1file.Key = m.Key
+
+	if m.AddedFilesCount >= 0 {
+		v1file.AddedFilesCount = &m.AddedFilesCount
+	} else {
+		v1file.AddedFilesCount = nil
+	}
+
+	if m.ExistingFilesCount >= 0 {
+		v1file.ExistingFilesCount = &m.ExistingFilesCount
+	} else {
+		v1file.ExistingFilesCount = nil
+	}
+
+	if m.DeletedFilesCount >= 0 {
+		v1file.DeletedFilesCount = &m.DeletedFilesCount
+	} else {
+		v1file.DeletedFilesCount = nil
+	}
+
+	if m.AddedRowsCount >= 0 {
+		v1file.AddedRowsCount = &m.AddedRowsCount
+	} else {
+		v1file.AddedRowsCount = nil
+	}
+
+	if m.ExistingRowsCount >= 0 {
+		v1file.ExistingRowsCount = &m.ExistingRowsCount
+	} else {
+		v1file.ExistingRowsCount = nil
+	}
+
+	if m.DeletedRowsCount >= 0 {
+		v1file.DeletedRowsCount = &m.DeletedRowsCount
+	} else {
+		v1file.DeletedRowsCount = nil
+	}
 }
 
-func (m *manifestFileV2) ExistingDataFiles() int32 {
-	return m.ExistingFilesCount
-}
-
-func (m *manifestFileV2) DeletedDataFiles() int32 {
-	return m.DeletedFilesCount
-}
-
-func (m *manifestFileV2) AddedRows() int64 {
-	return m.AddedRowsCount
-}
-
-func (m *manifestFileV2) ExistingRows() int64 {
-	return m.ExistingRowsCount
-}
-
-func (m *manifestFileV2) DeletedRows() int64 {
-	return m.DeletedRowsCount
-}
-
-func (m *manifestFileV2) SequenceNum() int64    { return m.SeqNumber }
-func (m *manifestFileV2) MinSequenceNum() int64 { return m.MinSeqNumber }
-func (m *manifestFileV2) KeyMetadata() []byte   { return m.Key }
-
-func (m *manifestFileV2) Partitions() []FieldSummary {
+func (m *manifestFile) Version() int                     { return m.version }
+func (m *manifestFile) FilePath() string                 { return m.Path }
+func (m *manifestFile) Length() int64                    { return m.Len }
+func (m *manifestFile) PartitionSpecID() int32           { return m.SpecID }
+func (m *manifestFile) ManifestContent() ManifestContent { return m.Content }
+func (m *manifestFile) SnapshotID() int64                { return m.AddedSnapshotID }
+func (m *manifestFile) AddedDataFiles() int32            { return m.AddedFilesCount }
+func (m *manifestFile) ExistingDataFiles() int32         { return m.ExistingFilesCount }
+func (m *manifestFile) DeletedDataFiles() int32          { return m.DeletedFilesCount }
+func (m *manifestFile) AddedRows() int64                 { return m.AddedRowsCount }
+func (m *manifestFile) ExistingRows() int64              { return m.ExistingRowsCount }
+func (m *manifestFile) DeletedRows() int64               { return m.DeletedRowsCount }
+func (m *manifestFile) SequenceNum() int64               { return m.SeqNumber }
+func (m *manifestFile) MinSequenceNum() int64            { return m.MinSeqNumber }
+func (m *manifestFile) KeyMetadata() []byte              { return m.Key }
+func (m *manifestFile) Partitions() []FieldSummary {
 	if m.PartitionList == nil {
 		return nil
 	}
+
 	return *m.PartitionList
 }
 
-func (m *manifestFileV2) HasAddedFiles() bool {
-	return m.AddedFilesCount > 0
-}
-
-func (m *manifestFileV2) HasExistingFiles() bool {
-	return m.ExistingFilesCount > 0
-}
-
-func (m *manifestFileV2) FetchEntries(fs iceio.IO, discardDeleted bool) ([]ManifestEntry, error) {
+func (m *manifestFile) HasAddedFiles() bool    { return m.AddedFilesCount != 0 }
+func (m *manifestFile) HasExistingFiles() bool { return m.ExistingFilesCount != 0 }
+func (m *manifestFile) FetchEntries(fs iceio.IO, discardDeleted bool) ([]ManifestEntry, error) {
 	return fetchManifestEntries(m, fs, discardDeleted)
-}
-
-// WriteEntries writes a list of manifest entries to an avro file.
-func (m *manifestFileV2) WriteEntries(out io.Writer, entries []ManifestEntry) error {
-	return writeManifestEntries(out, entries, m.Version())
 }
 
 func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType) {
@@ -382,6 +410,7 @@ func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType) {
 				return f
 			}
 		}
+
 		return nil
 	}
 
@@ -405,6 +434,7 @@ func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType) {
 			}
 		}
 	}
+
 	return result, logicalTypes
 }
 
@@ -432,15 +462,14 @@ func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) ([]M
 	}
 
 	fieldNameToID, fieldIDToLogicalType := getFieldIDMap(sc)
-	isVer1, isFallback := true, false
-	if string(metadata["format-version"]) == "2" {
-		isVer1 = false
-	} else {
+	isFallback := false
+	if string(metadata["format-version"]) == "1" {
 		for _, f := range sc.(*avro.RecordSchema).Fields() {
 			if f.Name() == "snapshot_id" {
-				if f.Type().Type() == avro.Union {
+				if f.Type().Type() != avro.Union {
 					isFallback = true
 				}
+
 				break
 			}
 		}
@@ -449,14 +478,12 @@ func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) ([]M
 	results := make([]ManifestEntry, 0)
 	for dec.HasNext() {
 		var tmp ManifestEntry
-		if isVer1 {
-			if isFallback {
-				tmp = &fallbackManifestEntryV1{manifestEntryV1: manifestEntryV1{Data: &dataFile{}}}
-			} else {
-				tmp = &manifestEntryV1{Data: &dataFile{}}
+		if isFallback {
+			tmp = &fallbackManifestEntry{
+				manifestEntry: manifestEntry{Data: &dataFile{}},
 			}
 		} else {
-			tmp = &manifestEntryV2{Data: &dataFile{}}
+			tmp = &manifestEntry{Data: &dataFile{}}
 		}
 
 		if err := dec.Decode(tmp); err != nil {
@@ -464,11 +491,11 @@ func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) ([]M
 		}
 
 		if isFallback {
-			tmp = tmp.(*fallbackManifestEntryV1).toEntry()
+			tmp = tmp.(*fallbackManifestEntry).toEntry()
 		}
 
 		if !discardDeleted || tmp.Status() != EntryStatusDELETED {
-			tmp.inheritSeqNum(m)
+			tmp.inherit(m)
 			if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
 				fieldToIDMap.setFieldNameToIDMap(fieldNameToID)
 				fieldToIDMap.setFieldIDToLogicalTypeMap(fieldIDToLogicalType)
@@ -540,10 +567,50 @@ type ManifestFile interface {
 	// If discardDeleted is true, entries for files containing deleted rows
 	// will be skipped.
 	FetchEntries(fs iceio.IO, discardDeleted bool) ([]ManifestEntry, error)
-	// WriteEntries writes a list of manifest entries to a provided
-	// io.Writer. The version of the manifest file is used to determine the
-	// schema to use for writing the entries.
-	WriteEntries(out io.Writer, entries []ManifestEntry) error
+	// // WriteEntries writes a list of manifest entries to a provided
+	// // io.Writer. The version of the manifest file is used to determine the
+	// // schema to use for writing the entries.
+	// WriteEntries(out io.Writer, entries []ManifestEntry) error
+
+	setVersion(int)
+}
+
+type fallbackManifest[T any] interface {
+	ManifestFile
+	toFile() *manifestFile
+	*T
+}
+
+func decodeManifestsWithFallback[P fallbackManifest[T], T any](dec *ocf.Decoder) ([]ManifestFile, error) {
+	results := make([]ManifestFile, 0)
+	for dec.HasNext() {
+		tmp := P(new(T))
+		if err := dec.Decode(tmp); err != nil {
+			return nil, err
+		}
+
+		results = append(results, tmp.toFile())
+	}
+
+	return results, dec.Error()
+}
+
+func decodeManifests[I interface {
+	ManifestFile
+	*T
+}, T any](dec *ocf.Decoder, version int) ([]ManifestFile, error) {
+	results := make([]ManifestFile, 0)
+	for dec.HasNext() {
+		tmp := I(new(T))
+		if err := dec.Decode(tmp); err != nil {
+			return nil, err
+		}
+
+		tmp.setVersion(version)
+		results = append(results, tmp)
+	}
+
+	return results, dec.Error()
 }
 
 // ReadManifestList reads in an avro manifest list file and returns a slice
@@ -559,85 +626,592 @@ func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
 		return nil, err
 	}
 
-	var fallbackAddedSnapshot bool
-	for _, f := range sc.(*avro.RecordSchema).Fields() {
-		if f.Name() == "added_snapshot_id" {
-			if f.Type().Type() == avro.Union {
-				fallbackAddedSnapshot = true
+	version, err := strconv.Atoi(string(dec.Metadata()["format-version"]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid format-version: %w", err)
+	}
+
+	if version == 1 {
+		for _, f := range sc.(*avro.RecordSchema).Fields() {
+			if f.Name() == "added_snapshot_id" {
+				if f.Type().Type() == avro.Union {
+					return decodeManifestsWithFallback[*fallbackManifestFileV1](dec)
+				}
+
+				break
 			}
-			break
 		}
 	}
 
-	out := make([]ManifestFile, 0)
-	for dec.HasNext() {
-		var file ManifestFile
-		if string(dec.Metadata()["format-version"]) == "2" {
-			file = &manifestFileV2{}
-		} else {
-			if fallbackAddedSnapshot {
-				file = &fallbackManifestFileV1{}
-			} else {
-				file = &manifestFileV1{}
-			}
-		}
-
-		if err := dec.Decode(file); err != nil {
-			return nil, err
-		}
-
-		if fallbackAddedSnapshot {
-			file = file.(*fallbackManifestFileV1).toManifest()
-		}
-
-		out = append(out, file)
+	switch version {
+	case 1:
+		return decodeManifestsWithFallback[*manifestFileV1](dec)
+	default:
+		return decodeManifests[*manifestFile](dec, version)
 	}
-
-	return out, dec.Error()
 }
 
-// WriteManifestList writes a list of v2 manifest files to an avro file.
-func WriteManifestList(out io.Writer, files []ManifestFile) error {
+type writerImpl interface {
+	content() ManifestContent
+	prepareEntry(*manifestEntry, int64) (ManifestEntry, error)
+}
+
+type v1writerImpl struct{}
+
+func (v1writerImpl) content() ManifestContent { return ManifestContentData }
+func (v1writerImpl) prepareEntry(entry *manifestEntry, sn int64) (ManifestEntry, error) {
+	return &fallbackManifestEntry{
+		manifestEntry: *entry,
+		Snapshot:      sn,
+	}, nil
+}
+
+type v2writerImpl struct{}
+
+func (v2writerImpl) content() ManifestContent { return ManifestContentData }
+func (v2writerImpl) prepareEntry(entry *manifestEntry, snapshotID int64) (ManifestEntry, error) {
+	if entry.SeqNum == nil {
+		if entry.Snapshot != nil && *entry.Snapshot != snapshotID {
+			return nil, fmt.Errorf("found unassigned sequence number for entry from snapshot: %d", entry.SnapshotID())
+		}
+
+		if entry.EntryStatus != EntryStatusADDED {
+			return nil, errors.New("only entries with status ADDED can be missing a sequence number")
+		}
+	}
+
+	return entry, nil
+}
+
+type fieldStats interface {
+	toSummary() FieldSummary
+	update(value any)
+}
+
+type partitionFieldStats[T LiteralType] struct {
+	containsNull bool
+	containsNan  bool
+	min          *T
+	max          *T
+
+	cmp Comparator[T]
+}
+
+func newPartitionFieldStat(typ PrimitiveType) fieldStats {
+	switch typ.(type) {
+	case Int32Type:
+		return &partitionFieldStats[int32]{cmp: getComparator[int32]()}
+	case Int64Type:
+		return &partitionFieldStats[int64]{cmp: getComparator[int64]()}
+	case Float32Type:
+		return &partitionFieldStats[float32]{cmp: getComparator[float32]()}
+	case Float64Type:
+		return &partitionFieldStats[float64]{cmp: getComparator[float64]()}
+	case StringType:
+		return &partitionFieldStats[string]{cmp: getComparator[string]()}
+	case DateType:
+		return &partitionFieldStats[Date]{cmp: getComparator[Date]()}
+	case TimeType:
+		return &partitionFieldStats[Time]{cmp: getComparator[Time]()}
+	case TimestampType:
+		return &partitionFieldStats[Timestamp]{cmp: getComparator[Timestamp]()}
+	case UUIDType:
+		return &partitionFieldStats[uuid.UUID]{cmp: getComparator[uuid.UUID]()}
+	case BinaryType:
+		return &partitionFieldStats[[]byte]{cmp: getComparator[[]byte]()}
+	case FixedType:
+		return &partitionFieldStats[[]byte]{cmp: getComparator[[]byte]()}
+	case DecimalType:
+		return &partitionFieldStats[Decimal]{cmp: getComparator[Decimal]()}
+	default:
+		panic(fmt.Sprintf("expected primitive type for partition type: %s", typ))
+	}
+}
+
+func (p *partitionFieldStats[T]) toSummary() FieldSummary {
+	var (
+		lowerBound *[]byte
+		upperBound *[]byte
+		lit        Literal
+	)
+
+	if p.min != nil {
+		lit = NewLiteral(*p.min)
+		lb, _ := lit.MarshalBinary()
+		lowerBound = &lb
+	}
+
+	if p.max != nil {
+		lit = NewLiteral(*p.max)
+		ub, _ := lit.MarshalBinary()
+		upperBound = &ub
+	}
+
+	return FieldSummary{
+		ContainsNull: p.containsNull,
+		ContainsNaN:  &p.containsNan,
+		LowerBound:   lowerBound,
+		UpperBound:   upperBound,
+	}
+}
+
+func (p *partitionFieldStats[T]) update(value any) {
+	if value == nil {
+		p.containsNull = true
+
+		return
+	}
+
+	var actualVal T
+	v := reflect.ValueOf(value)
+	if !v.CanConvert(reflect.TypeOf(actualVal)) {
+		panic(fmt.Sprintf("expected type %T, got %T", actualVal, value))
+	}
+
+	actualVal = v.Convert(reflect.TypeOf(actualVal)).Interface().(T)
+
+	switch f := any(actualVal).(type) {
+	case float32:
+		if math.IsNaN(float64(f)) {
+			p.containsNan = true
+
+			return
+		}
+	case float64:
+		if math.IsNaN(f) {
+			p.containsNan = true
+
+			return
+		}
+	}
+
+	if p.min == nil {
+		p.min = &actualVal
+		p.max = &actualVal
+	} else {
+		if p.cmp(actualVal, *p.min) < 0 {
+			p.min = &actualVal
+		}
+
+		if p.cmp(actualVal, *p.max) > 0 {
+			p.max = &actualVal
+		}
+	}
+}
+
+func constructPartitionSummaries(spec PartitionSpec, schema *Schema, partitions []map[string]any) ([]FieldSummary, error) {
+	partType := spec.PartitionType(schema)
+	fieldStats := make([]fieldStats, len(partType.FieldList))
+	for i, field := range partType.FieldList {
+		pt, ok := field.Type.(PrimitiveType)
+		if !ok {
+			return nil, fmt.Errorf("expected primitive type for partition field, got %s", field.Type)
+		}
+
+		fieldStats[i] = newPartitionFieldStat(pt)
+	}
+
+	for _, part := range partitions {
+		for i, field := range partType.FieldList {
+			fieldStats[i].update(part[field.Name])
+		}
+	}
+
+	summaries := make([]FieldSummary, len(fieldStats))
+	for i, stat := range fieldStats {
+		summaries[i] = stat.toSummary()
+	}
+
+	return summaries, nil
+}
+
+type ManifestWriter struct {
+	closed  bool
+	version int
+	impl    writerImpl
+
+	output io.Writer
+	writer *ocf.Encoder
+
+	spec   PartitionSpec
+	schema *Schema
+
+	snapshotID    int64
+	addedFiles    int32
+	addedRows     int64
+	existingFiles int32
+	existingRows  int64
+	deletedFiles  int32
+	deletedRows   int64
+
+	partitions  []map[string]any
+	minSeqNum   int64
+	reusedEntry manifestEntry
+}
+
+func NewManifestWriter(version int, out io.Writer, spec PartitionSpec, schema *Schema, snapshotID int64) (*ManifestWriter, error) {
+	var impl writerImpl
+
+	switch version {
+	case 1:
+		impl = v1writerImpl{}
+	case 2:
+		impl = v2writerImpl{}
+	default:
+		return nil, fmt.Errorf("unsupported manifest version: %d", version)
+	}
+
+	sc, err := partitionTypeToAvroSchema(spec.PartitionType(schema))
+	if err != nil {
+		return nil, err
+	}
+
+	fileSchema, err := internal.NewManifestEntrySchema(sc, version)
+	if err != nil {
+		return nil, err
+	}
+
+	w := &ManifestWriter{
+		impl:       impl,
+		version:    version,
+		output:     out,
+		spec:       spec,
+		schema:     schema,
+		snapshotID: snapshotID,
+		minSeqNum:  -1,
+		partitions: make([]map[string]any, 0),
+	}
+
+	md, err := w.meta()
+	if err != nil {
+		return nil, err
+	}
+
+	enc, err := ocf.NewEncoderWithSchema(fileSchema, out,
+		ocf.WithSchemaMarshaler(ocf.FullSchemaMarshaler),
+		ocf.WithMetadata(md),
+		ocf.WithCodec(ocf.Deflate))
+
+	w.writer = enc
+
+	return w, err
+}
+
+func (w *ManifestWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+
+	if w.addedFiles+w.existingFiles+w.deletedFiles == 0 {
+		return errors.New("empty manifest file has been written")
+	}
+
+	w.closed = true
+
+	return w.writer.Close()
+}
+
+func (w *ManifestWriter) ToManifestFile(location string, length int64) (ManifestFile, error) {
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+
+	if w.minSeqNum == initialSequenceNumber {
+		w.minSeqNum = -1
+	}
+
+	partitions, err := constructPartitionSummaries(w.spec, w.schema, w.partitions)
+	if err != nil {
+		return nil, err
+	}
+
+	return &manifestFile{
+		version:            w.version,
+		Path:               location,
+		Len:                length,
+		SpecID:             int32(w.spec.id),
+		Content:            ManifestContentData,
+		SeqNumber:          -1,
+		MinSeqNumber:       w.minSeqNum,
+		AddedSnapshotID:    w.snapshotID,
+		AddedFilesCount:    w.addedFiles,
+		ExistingFilesCount: w.existingFiles,
+		DeletedFilesCount:  w.deletedFiles,
+		AddedRowsCount:     w.addedRows,
+		ExistingRowsCount:  w.existingRows,
+		DeletedRowsCount:   w.deletedRows,
+		PartitionList:      &partitions,
+		Key:                nil,
+	}, nil
+}
+
+func (w *ManifestWriter) meta() (map[string][]byte, error) {
+	schemaJson, err := json.Marshal(w.schema)
+	if err != nil {
+		return nil, err
+	}
+
+	specFields := w.spec.fields
+
+	if specFields == nil {
+		specFields = []PartitionField{}
+	}
+
+	specFieldsJson, err := json.Marshal(specFields)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string][]byte{
+		"schema":            schemaJson,
+		"schema-id":         []byte(strconv.Itoa(w.schema.ID)),
+		"partition-spec":    specFieldsJson,
+		"partition-spec-id": []byte(strconv.Itoa(w.spec.ID())),
+		"format-version":    []byte(strconv.Itoa(w.version)),
+		"content":           []byte(w.impl.content().String()),
+	}, nil
+}
+
+func (w *ManifestWriter) addEntry(entry *manifestEntry) error {
+	if w.closed {
+		return errors.New("cannot add entry to closed manifest writer")
+	}
+
+	switch entry.Status() {
+	case EntryStatusADDED:
+		w.addedFiles++
+		w.addedRows += entry.DataFile().Count()
+	case EntryStatusEXISTING:
+		w.existingFiles++
+		w.existingRows += entry.DataFile().Count()
+	case EntryStatusDELETED:
+		w.deletedFiles++
+		w.deletedRows += entry.DataFile().Count()
+	default:
+		return fmt.Errorf("unknown entry status: %v", entry.Status())
+	}
+
+	w.partitions = append(w.partitions, entry.DataFile().Partition())
+	if (entry.Status() == EntryStatusADDED || entry.Status() == EntryStatusEXISTING) &&
+		entry.SequenceNum() > 0 && (w.minSeqNum < 0 || entry.SequenceNum() < w.minSeqNum) {
+		w.minSeqNum = entry.SequenceNum()
+	}
+
+	toEncode, err := w.impl.prepareEntry(entry, w.snapshotID)
+	if err != nil {
+		return err
+	}
+
+	return w.writer.Encode(toEncode)
+}
+
+func (w *ManifestWriter) Add(entry ManifestEntry) error {
+	w.reusedEntry.wrap(EntryStatusADDED, &w.snapshotID, entry.(*manifestEntry).SeqNum, nil, entry.DataFile())
+
+	return w.addEntry(&w.reusedEntry)
+}
+
+func (w *ManifestWriter) Delete(entry ManifestEntry) error {
+	w.reusedEntry.wrap(EntryStatusDELETED, &w.snapshotID, entry.(*manifestEntry).SeqNum, entry.FileSequenceNum(), entry.DataFile())
+
+	return w.addEntry(&w.reusedEntry)
+}
+
+func (w *ManifestWriter) Existing(entry ManifestEntry) error {
+	w.reusedEntry.wrap(EntryStatusEXISTING, &w.snapshotID, entry.(*manifestEntry).SeqNum, entry.FileSequenceNum(), entry.DataFile())
+
+	return w.addEntry(&w.reusedEntry)
+}
+
+type ManifestListWriter struct {
+	version          int
+	out              io.Writer
+	commitSnapshotID int64
+	sequenceNumber   int64
+	writer           *ocf.Encoder
+}
+
+func NewManifestListWriterV1(out io.Writer, snapshotID int64, parentSnapshot *int64) (*ManifestListWriter, error) {
+	m := &ManifestListWriter{
+		version:          1,
+		out:              out,
+		commitSnapshotID: snapshotID,
+		sequenceNumber:   -1,
+	}
+
+	parentSnapshotStr := "null"
+	if parentSnapshot != nil {
+		parentSnapshotStr = strconv.Itoa(int(*parentSnapshot))
+	}
+
+	return m, m.init(map[string][]byte{
+		"format-version":     []byte(strconv.Itoa(m.version)),
+		"snapshot-id":        []byte(strconv.Itoa(int(snapshotID))),
+		"parent-snapshot-id": []byte(parentSnapshotStr),
+	})
+}
+
+func NewManifestListWriterV2(out io.Writer, snapshotID, sequenceNumber int64, parentSnapshot *int64) (*ManifestListWriter, error) {
+	m := &ManifestListWriter{
+		version:          2,
+		out:              out,
+		commitSnapshotID: snapshotID,
+		sequenceNumber:   sequenceNumber,
+	}
+
+	parentSnapshotStr := "null"
+	if parentSnapshot != nil {
+		parentSnapshotStr = strconv.Itoa(int(*parentSnapshot))
+	}
+
+	return m, m.init(map[string][]byte{
+		"format-version":     []byte(strconv.Itoa(m.version)),
+		"snapshot-id":        []byte(strconv.Itoa(int(snapshotID))),
+		"sequence-number":    []byte(strconv.Itoa(int(sequenceNumber))),
+		"parent-snapshot-id": []byte(parentSnapshotStr),
+	})
+}
+
+func (m *ManifestListWriter) init(meta map[string][]byte) error {
+	fileSchema, err := internal.NewManifestFileSchema(m.version)
+	if err != nil {
+		return err
+	}
+
+	enc, err := ocf.NewEncoderWithSchema(fileSchema, m.out,
+		ocf.WithSchemaMarshaler(ocf.FullSchemaMarshaler),
+		ocf.WithMetadata(meta),
+		ocf.WithCodec(ocf.Deflate))
+	if err != nil {
+		return err
+	}
+
+	m.writer = enc
+
+	return nil
+}
+
+func (m *ManifestListWriter) Close() error {
+	if m.writer == nil {
+		return nil
+	}
+
+	return m.writer.Close()
+}
+
+func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 	if len(files) == 0 {
 		return nil
 	}
 
-	version := files[0].Version()
+	switch m.version {
+	case 1:
+		if slices.ContainsFunc(files, func(f ManifestFile) bool {
+			return f.Version() != 1
+		}) {
+			return fmt.Errorf("%w: ManifestListWriter only supports version 1 manifest files", ErrInvalidArgument)
+		}
 
-	for _, file := range files[1:] {
-		if file.Version() != version {
-			return fmt.Errorf(
-				"%w: ManifestFile '%s' has non-matching version %d instead of %d",
-				ErrInvalidArgument, file.FilePath(), file.Version(), version,
-			)
+		var tmp manifestFileV1
+		for _, file := range files {
+			file.(*manifestFile).toV1(&tmp)
+			if err := m.writer.Encode(&tmp); err != nil {
+				return err
+			}
+		}
+
+	case 2:
+		for _, file := range files {
+			if file.Version() != 2 {
+				return fmt.Errorf("%w: ManifestListWriter only supports version 2 manifest files", ErrInvalidArgument)
+			}
+
+			wrapped := *(file.(*manifestFile))
+			if wrapped.SeqNumber == -1 {
+				// if the sequence number is being assigned here,
+				// then the manifest must be created by the current
+				// operation.
+				// to validate this, check the snapshot id matches the current commmit
+				if m.commitSnapshotID != wrapped.AddedSnapshotID {
+					return fmt.Errorf("found unassigned sequence number for a manifest from snapshot %d != %d",
+						m.commitSnapshotID, wrapped.AddedSnapshotID)
+				}
+				wrapped.SeqNumber = m.sequenceNumber
+			}
+
+			if wrapped.MinSeqNumber == -1 {
+				if m.commitSnapshotID != wrapped.AddedSnapshotID {
+					return fmt.Errorf("found unassigned sequence number for a manifest from snapshot: %d", wrapped.AddedSnapshotID)
+				}
+				// if the min sequence number is not determined, then there was no assigned sequence number
+				// for any file written to the wrapped manifest. replace the unassigned sequence number with
+				// the one for this commit
+				wrapped.MinSeqNumber = m.sequenceNumber
+			}
+			if err := m.writer.Encode(wrapped); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported manifest version: %d", m.version)
+	}
+
+	return nil
+}
+
+// WriteManifestList writes a list of manifest files to an avro file.
+func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnapshotID, sequenceNumber *int64, files []ManifestFile) error {
+	var (
+		writer *ManifestListWriter
+		err    error
+	)
+
+	switch version {
+	case 1:
+		writer, err = NewManifestListWriterV1(out, snapshotID, parentSnapshotID)
+	case 2:
+		if sequenceNumber == nil {
+			return errors.New("sequence number is required for V2 tables")
+		}
+		writer, err = NewManifestListWriterV2(out, snapshotID, *sequenceNumber, parentSnapshotID)
+	default:
+		return fmt.Errorf("unsupported manifest version: %d", version)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if err = writer.AddManifests(files); err != nil {
+		return err
+	}
+
+	return writer.Close()
+}
+
+func WriteManifest(
+	filename string,
+	out io.Writer,
+	version int,
+	spec PartitionSpec,
+	schema *Schema,
+	snapshotID int64,
+	entries []ManifestEntry,
+) (ManifestFile, error) {
+	cnt := &internal.CountingWriter{W: out}
+
+	w, err := NewManifestWriter(version, cnt, spec, schema, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if err := w.addEntry(entry.(*manifestEntry)); err != nil {
+			return nil, err
 		}
 	}
 
-	var key string
-	switch version {
-	case 1:
-		key = internal.ManifestListV1Key
-	case 2:
-		key = internal.ManifestListV2Key
-	default:
-		return fmt.Errorf("%w: non-recognized version %d", ErrInvalidArgument, version)
-	}
-
-	return avroEncode(key, version, files, out)
-}
-
-func writeManifestEntries(out io.Writer, entries []ManifestEntry, version int) error {
-	var key string
-	switch version {
-	case 1:
-		key = internal.ManifestEntryV1Key
-	case 2:
-		key = internal.ManifestEntryV2Key
-	default:
-		return fmt.Errorf("%w: non-recognized version %d", ErrInvalidArgument, version)
-	}
-
-	return avroEncode(key, version, entries, out)
+	return w.ToManifestFile(filename, cnt.Count)
 }
 
 // ManifestEntryStatus defines constants for the entry status of
@@ -697,6 +1271,7 @@ func avroColMapToMap[K comparable, V any](c *[]colMap[K, V]) map[K]V {
 	for _, data := range *c {
 		out[data.Key] = data.Value
 	}
+
 	return out
 }
 
@@ -709,6 +1284,7 @@ func mapToAvroColMap[K comparable, V any](m map[K]V) *[]colMap[K, V] {
 	for k, v := range m {
 		out = append(out, colMap[K, V]{Key: k, Value: v})
 	}
+
 	return &out
 }
 
@@ -731,11 +1307,13 @@ func avroPartitionData(input map[string]any, nameToID map[string]int, logicalTyp
 				default:
 					out[k] = v
 				}
+
 				continue
 			}
 		}
 		out[k] = v
 	}
+
 	return out
 }
 
@@ -773,6 +1351,7 @@ type dataFile struct {
 	fieldNameToID        map[string]int
 	fieldIDToLogicalType map[int]avro.LogicalType
 
+	specID   int32
 	initMaps sync.Once
 }
 
@@ -799,44 +1378,53 @@ func (d *dataFile) FilePath() string                  { return d.Path }
 func (d *dataFile) FileFormat() FileFormat            { return d.Format }
 func (d *dataFile) Partition() map[string]any {
 	d.initializeMapData()
+
 	return d.PartitionData
 }
 
 func (d *dataFile) Count() int64         { return d.RecordCount }
 func (d *dataFile) FileSizeBytes() int64 { return d.FileSize }
+func (d *dataFile) SpecID() int32        { return d.specID }
 
 func (d *dataFile) ColumnSizes() map[int]int64 {
 	d.initializeMapData()
+
 	return d.colSizeMap
 }
 
 func (d *dataFile) ValueCounts() map[int]int64 {
 	d.initializeMapData()
+
 	return d.valCntMap
 }
 
 func (d *dataFile) NullValueCounts() map[int]int64 {
 	d.initializeMapData()
+
 	return d.nullCntMap
 }
 
 func (d *dataFile) NaNValueCounts() map[int]int64 {
 	d.initializeMapData()
+
 	return d.nanCntMap
 }
 
 func (d *dataFile) DistinctValueCounts() map[int]int64 {
 	d.initializeMapData()
+
 	return d.distinctCntMap
 }
 
 func (d *dataFile) LowerBoundValues() map[int][]byte {
 	d.initializeMapData()
+
 	return d.lowerBoundMap
 }
 
 func (d *dataFile) UpperBoundValues() map[int][]byte {
 	d.initializeMapData()
+
 	return d.upperBoundMap
 }
 
@@ -844,6 +1432,7 @@ func (d *dataFile) KeyMetadata() []byte {
 	if d.Key == nil {
 		return nil
 	}
+
 	return *d.Key
 }
 
@@ -851,6 +1440,7 @@ func (d *dataFile) SplitOffsets() []int64 {
 	if d.Splits == nil {
 		return nil
 	}
+
 	return *d.Splits
 }
 
@@ -858,110 +1448,43 @@ func (d *dataFile) EqualityFieldIDs() []int {
 	if d.EqualityIDs == nil {
 		return nil
 	}
+
 	return *d.EqualityIDs
 }
 
 func (d *dataFile) SortOrderID() *int { return d.SortOrder }
 
-// ManifestEntryV1Builder is a helper for building a V1 manifest entry
-// struct which will conform to the ManifestEntry interface.
-type ManifestEntryV1Builder struct {
-	m *manifestEntryV1
+type ManifestEntryBuilder struct {
+	m *manifestEntry
 }
 
-// NewManifestEntryV1Builder is passed all of the required fields and then allows
-// all of the optional fields to be set by calling the corresponding methods
-// before calling [ManifestEntryV1Builder.Build] to construct the object.
-func NewManifestEntryV1Builder(status ManifestEntryStatus, snapshotID int64, data DataFile) (*ManifestEntryV1Builder, error) {
-	return &ManifestEntryV1Builder{
-		m: &manifestEntryV1{
+func NewManifestEntryBuilder(status ManifestEntryStatus, snapshotID *int64, data DataFile) *ManifestEntryBuilder {
+	return &ManifestEntryBuilder{
+		m: &manifestEntry{
 			EntryStatus: status,
 			Snapshot:    snapshotID,
 			Data:        data,
 		},
-	}, nil
-}
-
-func (b *ManifestEntryV1Builder) Build() ManifestEntry {
-	return b.m
-}
-
-type manifestEntryV1 struct {
-	EntryStatus ManifestEntryStatus `avro:"status"`
-	Snapshot    int64               `avro:"snapshot_id"`
-	SeqNum      *int64
-	FileSeqNum  *int64
-	Data        DataFile `avro:"data_file"`
-}
-
-type fallbackManifestEntryV1 struct {
-	manifestEntryV1
-	Snapshot *int64 `avro:"snapshot_id"`
-}
-
-func (f *fallbackManifestEntryV1) toEntry() *manifestEntryV1 {
-	f.manifestEntryV1.Snapshot = *f.Snapshot
-	return &f.manifestEntryV1
-}
-
-func (m *manifestEntryV1) inheritSeqNum(manifest ManifestFile) {}
-
-func (m *manifestEntryV1) Status() ManifestEntryStatus { return m.EntryStatus }
-func (m *manifestEntryV1) SnapshotID() int64           { return m.Snapshot }
-
-func (m *manifestEntryV1) SequenceNum() int64 {
-	if m.SeqNum == nil {
-		return 0
-	}
-	return *m.SeqNum
-}
-
-func (m *manifestEntryV1) FileSequenceNum() *int64 {
-	return m.FileSeqNum
-}
-
-func (m *manifestEntryV1) DataFile() DataFile { return m.Data }
-
-// ManifestEntryV2Builder is a helper for building a V2 manifest entry
-// struct which will conform to the ManifestEntry interface.
-type ManifestEntryV2Builder struct {
-	m *manifestEntryV2
-}
-
-// NewManifestEntryV2Builder is passed all of the required fields and then allows
-// all of the optional fields to be set by calling the corresponding methods
-// before calling [ManifestEntryV2Builder.Build] to construct the object.
-func NewManifestEntryV2Builder(status ManifestEntryStatus, snapshotID int64, data DataFile) *ManifestEntryV2Builder {
-	return &ManifestEntryV2Builder{
-		m: &manifestEntryV2{
-			EntryStatus: status,
-			Snapshot:    &snapshotID,
-			Data:        data,
-		},
 	}
 }
 
-// SequenceNum sets the sequence number for the manifest entry.
-func (b *ManifestEntryV2Builder) SequenceNum(num int64) *ManifestEntryV2Builder {
+func (b *ManifestEntryBuilder) SequenceNum(num int64) *ManifestEntryBuilder {
 	b.m.SeqNum = &num
+
 	return b
 }
 
-// FileSequenceNum sets the file sequence number for the manifest entry.
-func (b *ManifestEntryV2Builder) FileSequenceNum(num int64) *ManifestEntryV2Builder {
+func (b *ManifestEntryBuilder) FileSequenceNum(num int64) *ManifestEntryBuilder {
 	b.m.FileSeqNum = &num
+
 	return b
 }
 
-// Build returns the constructed manifest entry, after calling Build this
-// builder should not be used further as we avoid copying by just returning
-// a pointer to the constructed manifest entry. Further calls to the modifier
-// methods after calling build would modify the constructed ManifestEntry.
-func (b *ManifestEntryV2Builder) Build() ManifestEntry {
+func (b *ManifestEntryBuilder) Build() ManifestEntry {
 	return b.m
 }
 
-type manifestEntryV2 struct {
+type manifestEntry struct {
 	EntryStatus ManifestEntryStatus `avro:"status"`
 	Snapshot    *int64              `avro:"snapshot_id"`
 	SeqNum      *int64              `avro:"sequence_number"`
@@ -969,42 +1492,77 @@ type manifestEntryV2 struct {
 	Data        DataFile            `avro:"data_file"`
 }
 
-func (m *manifestEntryV2) inheritSeqNum(manifest ManifestFile) {
+func (m *manifestEntry) Status() ManifestEntryStatus { return m.EntryStatus }
+func (m *manifestEntry) SnapshotID() int64 {
+	if m.Snapshot == nil {
+		return -1
+	}
+
+	return *m.Snapshot
+}
+
+func (m *manifestEntry) SequenceNum() int64 {
+	if m.SeqNum == nil {
+		return -1
+	}
+
+	return *m.SeqNum
+}
+
+func (m *manifestEntry) FileSequenceNum() *int64 {
+	return m.FileSeqNum
+}
+
+func (m *manifestEntry) DataFile() DataFile { return m.Data }
+
+func (m *manifestEntry) inherit(manifest ManifestFile) {
 	if m.Snapshot == nil {
 		snap := manifest.SnapshotID()
 		m.Snapshot = &snap
 	}
 
 	manifestSequenceNum := manifest.SequenceNum()
-	if m.SeqNum == nil && (manifestSequenceNum == 0 || m.EntryStatus == EntryStatusADDED) {
+	if m.SeqNum == nil && (manifestSequenceNum == initialSequenceNumber || m.EntryStatus == EntryStatusADDED) {
 		m.SeqNum = &manifestSequenceNum
 	}
 
-	if m.FileSeqNum == nil && (manifestSequenceNum == 0 || m.EntryStatus == EntryStatusADDED) {
+	if m.FileSeqNum == nil && (manifestSequenceNum == initialSequenceNumber || m.EntryStatus == EntryStatusADDED) {
 		m.FileSeqNum = &manifestSequenceNum
 	}
+
+	m.Data.(*dataFile).specID = manifest.PartitionSpecID()
 }
 
-func (m *manifestEntryV2) Status() ManifestEntryStatus { return m.EntryStatus }
-func (m *manifestEntryV2) SnapshotID() int64 {
-	if m.Snapshot == nil {
-		return 0
+func (m *manifestEntry) wrap(status ManifestEntryStatus, newSnapID, newSeq, newFileSeq *int64, data DataFile) ManifestEntry {
+	m.EntryStatus = status
+	m.Snapshot = newSnapID
+	m.SeqNum = newSeq
+	m.FileSeqNum = newFileSeq
+	m.Data = data
+
+	return m
+}
+
+type fallbackManifestEntry struct {
+	manifestEntry
+	Snapshot int64 `avro:"snapshot_id"`
+}
+
+func (f *fallbackManifestEntry) toEntry() *manifestEntry {
+	f.manifestEntry.Snapshot = &f.Snapshot
+
+	return &f.manifestEntry
+}
+
+func NewManifestEntry(status ManifestEntryStatus, snapshotID *int64, seqNum, fileSeqNum *int64, df DataFile) ManifestEntry {
+	return &manifestEntry{
+		EntryStatus: status,
+		Snapshot:    snapshotID,
+		SeqNum:      seqNum,
+		FileSeqNum:  fileSeqNum,
+		Data:        df,
 	}
-	return *m.Snapshot
 }
-
-func (m *manifestEntryV2) SequenceNum() int64 {
-	if m.SeqNum == nil {
-		return 0
-	}
-	return *m.SeqNum
-}
-
-func (m *manifestEntryV2) FileSequenceNum() *int64 {
-	return m.FileSeqNum
-}
-
-func (m *manifestEntryV2) DataFile() DataFile { return m.Data }
 
 // DataFileBuilder is a helper for building a data file struct which will
 // conform to the DataFile interface.
@@ -1016,6 +1574,7 @@ type DataFileBuilder struct {
 // all of the optional fields to be set by calling the corresponding methods
 // before calling [DataFileBuilder.Build] to construct the object.
 func NewDataFileBuilder(
+	spec PartitionSpec,
 	content ManifestEntryContent,
 	path string,
 	format FileFormat,
@@ -1057,6 +1616,7 @@ func NewDataFileBuilder(
 			PartitionData: partitionData,
 			RecordCount:   recordCount,
 			FileSize:      fileSize,
+			specID:        int32(spec.id),
 		},
 	}, nil
 }
@@ -1064,72 +1624,84 @@ func NewDataFileBuilder(
 // BlockSizeInBytes sets the block size in bytes for the data file. Deprecated in v2.
 func (b *DataFileBuilder) BlockSizeInBytes(size int64) *DataFileBuilder {
 	b.d.BlockSizeInBytes = size
+
 	return b
 }
 
 // ColumnSizes sets the column sizes for the data file.
 func (b *DataFileBuilder) ColumnSizes(sizes map[int]int64) *DataFileBuilder {
 	b.d.ColSizes = mapToAvroColMap(sizes)
+
 	return b
 }
 
 // ValueCounts sets the value counts for the data file.
 func (b *DataFileBuilder) ValueCounts(counts map[int]int64) *DataFileBuilder {
 	b.d.ValCounts = mapToAvroColMap(counts)
+
 	return b
 }
 
 // NullValueCounts sets the null value counts for the data file.
 func (b *DataFileBuilder) NullValueCounts(counts map[int]int64) *DataFileBuilder {
 	b.d.NullCounts = mapToAvroColMap(counts)
+
 	return b
 }
 
 // NaNValueCounts sets the NaN value counts for the data file.
 func (b *DataFileBuilder) NaNValueCounts(counts map[int]int64) *DataFileBuilder {
 	b.d.NaNCounts = mapToAvroColMap(counts)
+
 	return b
 }
 
 // DistinctValueCounts sets the distinct value counts for the data file.
 func (b *DataFileBuilder) DistinctValueCounts(counts map[int]int64) *DataFileBuilder {
 	b.d.DistinctCounts = mapToAvroColMap(counts)
+
 	return b
 }
 
 // LowerBoundValues sets the lower bound values for the data file.
 func (b *DataFileBuilder) LowerBoundValues(bounds map[int][]byte) *DataFileBuilder {
 	b.d.LowerBounds = mapToAvroColMap(bounds)
+
 	return b
 }
 
 // UpperBoundValues sets the upper bound values for the data file.
 func (b *DataFileBuilder) UpperBoundValues(bounds map[int][]byte) *DataFileBuilder {
 	b.d.UpperBounds = mapToAvroColMap(bounds)
+
 	return b
 }
 
 // KeyMetadata sets the key metadata for the data file.
 func (b *DataFileBuilder) KeyMetadata(key []byte) *DataFileBuilder {
 	b.d.Key = &key
+
 	return b
 }
 
 // SplitOffsets sets the split offsets for the data file.
 func (b *DataFileBuilder) SplitOffsets(offsets []int64) *DataFileBuilder {
 	b.d.Splits = &offsets
+
 	return b
 }
 
 // EqualityFieldIDs sets the equality field ids for the data file.
 func (b *DataFileBuilder) EqualityFieldIDs(ids []int) *DataFileBuilder {
 	b.d.EqualityIDs = &ids
+
 	return b
 }
 
 // SortOrderID sets the sort order id for the data file.
 func (b *DataFileBuilder) SortOrderID(id int) *DataFileBuilder {
 	b.d.SortOrder = &id
+
 	return b
 }
 
@@ -1196,6 +1768,9 @@ type DataFile interface {
 	// SortOrderID returns the id representing the sort order for this
 	// file, or nil if there is no sort order.
 	SortOrderID() *int
+	// SpecID returns the partition spec id for this data file, inherited
+	// from the manifest that the data file was read from
+	SpecID() int32
 }
 
 // ManifestEntry is an interface for both v1 and v2 manifest entries.
@@ -1218,7 +1793,9 @@ type ManifestEntry interface {
 	// by this manifest entry.
 	DataFile() DataFile
 
-	inheritSeqNum(manifest ManifestFile)
+	inherit(manifest ManifestFile)
+
+	wrap(status ManifestEntryStatus, snapshotID, seqNum, fileSeqNum *int64, datafile DataFile) ManifestEntry
 }
 
 var PositionalDeleteSchema = NewSchema(0,

@@ -22,8 +22,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
-	"path"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -89,9 +90,7 @@ func init() {
 	}))
 }
 
-var (
-	_ catalog.Catalog = (*Catalog)(nil)
-)
+var _ catalog.Catalog = (*Catalog)(nil)
 
 var (
 	minimalNamespaceProps = iceberg.Properties{"exists": "true"}
@@ -125,6 +124,7 @@ func getDialect(d SupportedDialect) schema.Dialect {
 		ret = createDialect(d)
 		dialects[d] = ret
 	}
+
 	return ret
 }
 
@@ -150,8 +150,10 @@ type sqlIcebergNamespaceProps struct {
 func withReadTx[R any](ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) (R, error)) (result R, err error) {
 	db.RunInTx(ctx, &sql.TxOptions{ReadOnly: true}, func(ctx context.Context, tx bun.Tx) error {
 		result, err = fn(ctx, tx)
+
 		return err
 	})
+
 	return
 }
 
@@ -216,6 +218,7 @@ func (c *Catalog) CreateSQLTables(ctx context.Context) error {
 
 	_, err = c.db.NewCreateTable().Model((*sqlIcebergNamespaceProps)(nil)).
 		IfNotExists().Exec(ctx)
+
 	return err
 }
 
@@ -228,6 +231,7 @@ func (c *Catalog) DropSQLTables(ctx context.Context) error {
 
 	_, err = c.db.NewDropTable().Model((*sqlIcebergNamespaceProps)(nil)).
 		IfExists().Exec(ctx)
+
 	return err
 }
 
@@ -261,11 +265,11 @@ func (c *Catalog) getDefaultWarehouseLocation(ctx context.Context, nsname, table
 	}
 
 	if dblocation := dbprops.Get("location", ""); dblocation != "" {
-		return path.Join(dblocation, tableName), nil
+		return url.JoinPath(dblocation, tableName)
 	}
 
 	if warehousepath := c.props.Get("warehouse", ""); warehousepath != "" {
-		return warehousepath + "/" + path.Join(nsname+".db", tableName), nil
+		return url.JoinPath(warehousepath, nsname+".db", tableName)
 	}
 
 	return "", errors.New("no default path set, please specify a location when creating a table")
@@ -283,6 +287,7 @@ func checkValidNamespace(ident table.Identifier) error {
 	if len(ident) < 1 {
 		return fmt.Errorf("%w: empty namespace identifier", catalog.ErrNoSuchNamespace)
 	}
+
 	return nil
 }
 
@@ -326,13 +331,12 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 			TableName:        tblIdent,
 			MetadataLocation: sql.NullString{String: metadataLocation, Valid: true},
 		}).Exec(ctx)
-
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
 		}
+
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -340,8 +344,119 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 	return c.LoadTable(ctx, ident, cfg.Properties)
 }
 
+func (c *Catalog) updateAndStageTable(ctx context.Context, current *table.Table, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (*table.StagedTable, error) {
+	var (
+		baseMeta    table.Metadata
+		metadataLoc string
+	)
+
+	if current != nil {
+		for _, r := range reqs {
+			if err := r.Validate(current.Metadata()); err != nil {
+				return nil, err
+			}
+		}
+
+		baseMeta = current.Metadata()
+		metadataLoc = current.MetadataLocation()
+	} else {
+		var err error
+		baseMeta, err = table.NewMetadata(iceberg.NewSchema(0), nil, table.UnsortedSortOrder, "", nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	updated, err := internal.UpdateTableMetadata(baseMeta, updates, metadataLoc)
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := table.LoadLocationProvider(updated.Location(), updated.Properties())
+	if err != nil {
+		return nil, err
+	}
+
+	newVersion := internal.ParseMetadataVersion(metadataLoc) + 1
+	newLocation, err := provider.NewTableMetadataFileLocation(newVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	fs, err := io.LoadFS(ctx, updated.Properties(), newLocation)
+	if err != nil {
+		return nil, err
+	}
+
+	return &table.StagedTable{Table: table.New(ident, updated, newLocation, fs, c)}, nil
+}
+
 func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
-	panic("commit table not implemented for SQLCatalog")
+	ns := catalog.NamespaceFromIdent(tbl.Identifier())
+	tblName := catalog.TableNameFromIdent(tbl.Identifier())
+
+	current, err := c.LoadTable(ctx, tbl.Identifier(), nil)
+	if err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
+		return nil, "", err
+	}
+
+	staged, err := c.updateAndStageTable(ctx, current, tbl.Identifier(), reqs, updates)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if current != nil && staged.Metadata().Equals(current.Metadata()) {
+		// no changes, do nothing
+		return current.Metadata(), current.MetadataLocation(), nil
+	}
+
+	if err := internal.WriteMetadata(ctx, staged.Metadata(), staged.MetadataLocation(), staged.Properties()); err != nil {
+		return nil, "", err
+	}
+
+	err = withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
+		if current != nil {
+			res, err := tx.NewUpdate().Model(&sqlIcebergTable{
+				CatalogName:              c.name,
+				TableNamespace:           strings.Join(ns, "."),
+				TableName:                tblName,
+				MetadataLocation:         sql.NullString{Valid: true, String: staged.MetadataLocation()},
+				PreviousMetadataLocation: sql.NullString{Valid: true, String: current.MetadataLocation()},
+			}).WherePK().Where("metadata_location = ?", current.MetadataLocation()).
+				Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("error updating table information: %w", err)
+			}
+
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("error updating table information: %w", err)
+			}
+
+			if n == 0 {
+				return fmt.Errorf("table has been updated by another process: %s.%s", strings.Join(ns, "."), tblName)
+			}
+
+			return nil
+		}
+
+		_, err := tx.NewInsert().Model(&sqlIcebergTable{
+			CatalogName:      c.name,
+			TableNamespace:   strings.Join(ns, "."),
+			TableName:        tblName,
+			MetadataLocation: sql.NullString{Valid: true, String: staged.MetadataLocation()},
+		}).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	return staged.Metadata(), staged.MetadataLocation(), nil
 }
 
 func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, props iceberg.Properties) (*table.Table, error) {
@@ -366,6 +481,7 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 		if err != nil {
 			return nil, fmt.Errorf("error encountered loading table %s: %w", identifier, err)
 		}
+
 		return t, nil
 	})
 	if err != nil {
@@ -383,7 +499,8 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 	if err != nil {
 		return nil, err
 	}
-	return table.NewFromLocation(identifier, result.MetadataLocation.String, iofs)
+
+	return table.NewFromLocation(identifier, result.MetadataLocation.String, iofs, c)
 }
 
 func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) error {
@@ -408,6 +525,7 @@ func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) er
 		if n == 0 {
 			return fmt.Errorf("%w: %s", catalog.ErrNoSuchTable, identifier)
 		}
+
 		return nil
 	})
 }
@@ -461,6 +579,7 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 		if n == 0 {
 			return fmt.Errorf("%w: %s", catalog.ErrNoSuchTable, from)
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -489,6 +608,7 @@ func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifie
 	}
 
 	nsToCreate := strings.Join(namespace, ".")
+
 	return withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		toInsert := make([]sqlIcebergNamespaceProps, 0, len(props))
 		for k, v := range props {
@@ -504,6 +624,7 @@ func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifie
 		if err != nil {
 			return fmt.Errorf("error inserting namespace properties for namespace '%s': %w", namespace, err)
 		}
+
 		return nil
 	})
 }
@@ -524,9 +645,16 @@ func (c *Catalog) DropNamespace(ctx context.Context, namespace table.Identifier)
 		return fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, nsToDelete)
 	}
 
-	tbls, err := c.ListTables(ctx, namespace)
-	if err != nil {
-		return err
+	tbls := make([]table.Identifier, 0)
+	iter := c.ListTables(ctx, namespace)
+
+	for tbl, err := range iter {
+		tbls = append(tbls, tbl)
+		if err != nil {
+			return err
+		}
+
+		break // there is already at least a table
 	}
 
 	if len(tbls) > 0 {
@@ -540,6 +668,7 @@ func (c *Catalog) DropNamespace(ctx context.Context, namespace table.Identifier)
 		if err != nil {
 			return fmt.Errorf("error deleting namespace '%s': %w", namespace, err)
 		}
+
 		return nil
 	})
 }
@@ -572,11 +701,29 @@ func (c *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.I
 		for _, p := range props {
 			result[p.PropertyKey] = p.PropertyValue.String
 		}
+
 		return result, nil
 	})
 }
 
-func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) ([]table.Identifier, error) {
+func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
+	tables, err := c.listTablesAll(ctx, namespace)
+	if err != nil {
+		return func(yield func(table.Identifier, error) bool) {
+			yield(table.Identifier{}, err)
+		}
+	}
+
+	return func(yield func(table.Identifier, error) bool) {
+		for _, t := range tables {
+			if !yield(t, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (c *Catalog) listTablesAll(ctx context.Context, namespace table.Identifier) ([]table.Identifier, error) {
 	if len(namespace) > 0 {
 		exists, err := c.namespaceExists(ctx, strings.Join(namespace, "."))
 		if err != nil {
@@ -594,6 +741,7 @@ func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) ([
 			Where("catalog_name = ?", c.name).
 			Where("table_namespace = ?", ns).
 			Scan(ctx)
+
 		return tables, err
 	})
 	if err != nil {
@@ -604,6 +752,7 @@ func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) ([
 	for i, t := range tables {
 		ret[i] = append(strings.Split(t.TableNamespace, "."), t.TableName)
 	}
+
 	return ret, nil
 }
 
@@ -637,6 +786,7 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 		}
 
 		err = c.db.ScanRows(ctx, rows, &namespaces)
+
 		return namespaces, err
 	})
 	if err != nil {
@@ -647,6 +797,7 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 	for i, n := range namespaces {
 		ret[i] = strings.Split(n, ".")
 	}
+
 	return ret, nil
 }
 
@@ -669,6 +820,7 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 	}
 
 	nsToUpdate := strings.Join(namespace, ".")
+
 	return summary, withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		var m *sqlIcebergNamespaceProps
 		if len(removals) > 0 {

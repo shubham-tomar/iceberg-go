@@ -19,6 +19,7 @@ package iceberg
 
 import (
 	"bytes"
+	"io"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ var (
 	snapshotID            int64 = 9182715666859759686
 	addedRows             int64 = 237993
 	manifestFileRecordsV1       = []ManifestFile{
-		NewManifestV1Builder("/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
+		NewManifestFile(1, "/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
 			7989, 0, snapshotID).
 			AddedFiles(3).
 			ExistingFiles(0).
@@ -43,11 +44,13 @@ var (
 				ContainsNull: true, ContainsNaN: &falseBool,
 				LowerBound: &[]byte{0x01, 0x00, 0x00, 0x00},
 				UpperBound: &[]byte{0x02, 0x00, 0x00, 0x00},
-			}}).Build()}
+			}}).Build(),
+	}
 
 	manifestFileRecordsV2 = []ManifestFile{
-		NewManifestV2Builder("/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
-			7989, 0, ManifestContentDeletes, snapshotID).
+		NewManifestFile(2, "/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
+			7989, 0, snapshotID).
+			Content(ManifestContentDeletes).
 			SequenceNum(3, 3).
 			AddedFiles(3).
 			ExistingFiles(0).
@@ -60,14 +63,15 @@ var (
 				ContainsNaN:  &falseBool,
 				LowerBound:   &[]byte{0x01, 0x00, 0x00, 0x00},
 				UpperBound:   &[]byte{0x02, 0x00, 0x00, 0x00},
-			}}).Build()}
+			}}).Build(),
+	}
 
 	entrySnapshotID        int64 = 8744736658442914487
 	intZero                      = 0
-	manifestEntryV1Records       = []*manifestEntryV1{
+	manifestEntryV1Records       = []*manifestEntry{
 		{
 			EntryStatus: EntryStatusADDED,
-			Snapshot:    entrySnapshotID,
+			Snapshot:    &entrySnapshotID,
 			Data: &dataFile{
 				// bad value for Content but this field doesn't exist in V1
 				// so it shouldn't get written and shouldn't be read back out
@@ -76,7 +80,7 @@ var (
 				Content:          EntryContentEqDeletes,
 				Path:             "/home/iceberg/warehouse/nyc/taxis_partitioned/data/VendorID=null/00000-633-d8a4223e-dc97-45a1-86e1-adaba6e8abd7-00001.parquet",
 				Format:           ParquetFile,
-				PartitionData:    map[string]any{"VendorID": int(1), "tpep_pickup_datetime": time.Unix(1925, 0)},
+				PartitionData:    map[string]any{"VendorID": int(1), "tpep_pickup_datetime": time.Unix(1925, 0).UnixMicro()},
 				RecordCount:      19513,
 				FileSize:         388872,
 				BlockSizeInBytes: 67108864,
@@ -191,11 +195,11 @@ var (
 		},
 		{
 			EntryStatus: EntryStatusADDED,
-			Snapshot:    8744736658442914487,
+			Snapshot:    &entrySnapshotID,
 			Data: &dataFile{
 				Path:             "/home/iceberg/warehouse/nyc/taxis_partitioned/data/VendorID=1/00000-633-d8a4223e-dc97-45a1-86e1-adaba6e8abd7-00002.parquet",
 				Format:           ParquetFile,
-				PartitionData:    map[string]any{"VendorID": int(1), "tpep_pickup_datetime": time.Unix(1925, 0)},
+				PartitionData:    map[string]any{"VendorID": int(1), "tpep_pickup_datetime": time.Unix(1925, 0).UnixMicro()},
 				RecordCount:      95050,
 				FileSize:         1265950,
 				BlockSizeInBytes: 67108864,
@@ -323,7 +327,7 @@ var (
 	dataRecord0 = manifestEntryV1Records[0].Data.(*dataFile)
 	dataRecord1 = manifestEntryV1Records[1].Data.(*dataFile)
 
-	manifestEntryV2Records = []*manifestEntryV2{
+	manifestEntryV2Records = []*manifestEntry{
 		{
 			EntryStatus: EntryStatusADDED,
 			Snapshot:    &entrySnapshotID,
@@ -365,6 +369,28 @@ var (
 			},
 		},
 	}
+
+	testSchema = NewSchema(0,
+		NestedField{ID: 1, Name: "VendorID", Type: PrimitiveTypes.Int32, Required: true},
+		NestedField{ID: 2, Name: "tpep_pickup_datetime", Type: PrimitiveTypes.Timestamp, Required: true},
+		NestedField{ID: 3, Name: "tpep_dropoff_datetime", Type: PrimitiveTypes.Timestamp, Required: true},
+		NestedField{ID: 4, Name: "passenger_count", Type: PrimitiveTypes.Int64, Required: false},
+		NestedField{ID: 5, Name: "trip_distance", Type: PrimitiveTypes.Float64, Required: true},
+		NestedField{ID: 6, Name: "RatecodeID", Type: PrimitiveTypes.Int64, Required: false},
+		NestedField{ID: 7, Name: "store_and_fwd_flag", Type: PrimitiveTypes.String, Required: false},
+		NestedField{ID: 8, Name: "PULocationID", Type: PrimitiveTypes.Int32, Required: false},
+		NestedField{ID: 9, Name: "DOLocationID", Type: PrimitiveTypes.Int32, Required: false},
+		NestedField{ID: 10, Name: "payment_type", Type: PrimitiveTypes.Int64, Required: true},
+		NestedField{ID: 11, Name: "fare_amount", Type: PrimitiveTypes.Float64, Required: true},
+		NestedField{ID: 12, Name: "extra", Type: PrimitiveTypes.Float64, Required: false},
+		NestedField{ID: 13, Name: "mta_tax", Type: PrimitiveTypes.Float64, Required: false},
+		NestedField{ID: 14, Name: "tip_amount", Type: PrimitiveTypes.Float64, Required: false},
+		NestedField{ID: 15, Name: "tolls_amount", Type: PrimitiveTypes.Float64, Required: false},
+		NestedField{ID: 16, Name: "improvement_surcharge", Type: PrimitiveTypes.Float64, Required: false},
+		NestedField{ID: 17, Name: "total_amount", Type: PrimitiveTypes.Float64, Required: true},
+		NestedField{ID: 18, Name: "congestion_surcharge", Type: PrimitiveTypes.Float64, Required: false},
+		NestedField{ID: 19, Name: "VendorID", Type: PrimitiveTypes.Int32, Required: false},
+	)
 )
 
 type ManifestTestSuite struct {
@@ -378,8 +404,9 @@ type ManifestTestSuite struct {
 }
 
 func (m *ManifestTestSuite) writeManifestList() {
-	m.Require().NoError(WriteManifestList(&m.v1ManifestList, manifestFileRecordsV1))
-	m.Require().NoError(WriteManifestList(&m.v2ManifestList, manifestFileRecordsV2))
+	m.Require().NoError(WriteManifestList(1, &m.v1ManifestList, snapshotID, nil, nil, manifestFileRecordsV1))
+	unassignedSequenceNum := int64(-1)
+	m.Require().NoError(WriteManifestList(2, &m.v2ManifestList, snapshotID, nil, &unassignedSequenceNum, manifestFileRecordsV2))
 }
 
 func (m *ManifestTestSuite) writeManifestEntries() {
@@ -393,8 +420,17 @@ func (m *ManifestTestSuite) writeManifestEntries() {
 		manifestEntryV2Recs[i] = rec
 	}
 
-	m.Require().NoError(writeManifestEntries(&m.v1ManifestEntries, manifestEntryV1Recs, 1))
-	m.Require().NoError(writeManifestEntries(&m.v2ManifestEntries, manifestEntryV2Recs, 2))
+	partitionSpec := NewPartitionSpecID(1,
+		PartitionField{FieldID: 1000, SourceID: 1, Name: "VendorID", Transform: IdentityTransform{}},
+		PartitionField{FieldID: 1001, SourceID: 2, Name: "tpep_pickup_datetime", Transform: IdentityTransform{}})
+
+	_, err := WriteManifest("/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
+		&m.v1ManifestEntries, 1, partitionSpec, testSchema, entrySnapshotID, manifestEntryV1Recs)
+	m.Require().NoError(err)
+
+	_, err = WriteManifest("/home/iceberg/warehouse/nyc/taxis_partitioned/metadata/0125c686-8aa6-4502-bdcc-b6d17ca41a3b-m0.avro",
+		&m.v2ManifestEntries, 2, partitionSpec, testSchema, entrySnapshotID, manifestEntryV2Recs)
+	m.Require().NoError(err)
 }
 
 func (m *ManifestTestSuite) SetupSuite() {
@@ -404,13 +440,15 @@ func (m *ManifestTestSuite) SetupSuite() {
 
 func (m *ManifestTestSuite) TestManifestEntriesV1() {
 	var mockfs internal.MockFS
-	manifest := manifestFileV1{
-		Path: manifestFileRecordsV1[0].FilePath(),
+	manifest := manifestFile{
+		version: 1,
+		Path:    manifestFileRecordsV1[0].FilePath(),
 	}
 
 	mockfs.Test(m.T())
 	mockfs.On("Open", manifest.FilePath()).Return(&internal.MockFile{
-		Contents: bytes.NewReader(m.v1ManifestEntries.Bytes())}, nil)
+		Contents: bytes.NewReader(m.v1ManifestEntries.Bytes()),
+	}, nil)
 	defer mockfs.AssertExpectations(m.T())
 	entries, err := manifest.FetchEntries(&mockfs, false)
 	m.Require().NoError(err)
@@ -429,7 +467,8 @@ func (m *ManifestTestSuite) TestManifestEntriesV1() {
 	m.Equal(EntryStatusADDED, entry1.Status())
 	m.EqualValues(8744736658442914487, entry1.SnapshotID())
 	m.Zero(entry1.SequenceNum())
-	m.Nil(entry1.FileSequenceNum())
+	m.NotNil(entry1.FileSequenceNum())
+	m.Zero(*entry1.FileSequenceNum())
 
 	datafile := entry1.DataFile()
 	m.Equal(EntryContentData, datafile.ContentType())
@@ -604,13 +643,15 @@ func (m *ManifestTestSuite) TestReadManifestListV2() {
 
 func (m *ManifestTestSuite) TestManifestEntriesV2() {
 	var mockfs internal.MockFS
-	manifest := manifestFileV2{
-		Path: manifestFileRecordsV2[0].FilePath(),
+	manifest := manifestFile{
+		version: 2,
+		Path:    manifestFileRecordsV2[0].FilePath(),
 	}
 
 	mockfs.Test(m.T())
 	mockfs.On("Open", manifest.FilePath()).Return(&internal.MockFile{
-		Contents: bytes.NewReader(m.v2ManifestEntries.Bytes())}, nil)
+		Contents: bytes.NewReader(m.v2ManifestEntries.Bytes()),
+	}, nil)
 	defer mockfs.AssertExpectations(m.T())
 	entries, err := manifest.FetchEntries(&mockfs, false)
 	m.Require().NoError(err)
@@ -744,10 +785,11 @@ func (m *ManifestTestSuite) TestManifestEntriesV2() {
 
 func (m *ManifestTestSuite) TestManifestEntryBuilder() {
 	dataFileBuilder, err := NewDataFileBuilder(
+		NewPartitionSpec(),
 		EntryContentData,
 		"sample.parquet",
 		ParquetFile,
-		map[string]any{"int": int(1), "datetime": time.Unix(1925, 0)},
+		map[string]any{"int": int(1), "datetime": time.Unix(1925, 0).UnixMicro()},
 		1,
 		2,
 	)
@@ -776,17 +818,16 @@ func (m *ManifestTestSuite) TestManifestEntryBuilder() {
 		2: []byte("2020-04-30 23:5:"),
 	}).SplitOffsets([]int64{4}).EqualityFieldIDs([]int{1, 1}).SortOrderID(0)
 
-	builder, err := NewManifestEntryV1Builder(
+	snapshotEntryID := int64(1)
+	entry := NewManifestEntryBuilder(
 		EntryStatusEXISTING,
-		1,
-		dataFileBuilder.Build(),
-	)
-	m.Require().NoError(err)
+		&snapshotEntryID,
+		dataFileBuilder.Build()).Build()
 
-	entry := builder.Build()
 	m.Assert().Equal(EntryStatusEXISTING, entry.Status())
 	m.Assert().EqualValues(1, entry.SnapshotID())
-	m.Assert().Equal(int64(0), entry.SequenceNum())
+	// unassigned sequence number
+	m.Assert().Equal(int64(-1), entry.SequenceNum())
 	m.Assert().Nil(entry.FileSequenceNum())
 	data := entry.DataFile()
 	m.Assert().Equal(EntryContentData, data.ContentType())
@@ -825,6 +866,16 @@ func (m *ManifestTestSuite) TestManifestEntryBuilder() {
 	m.Assert().Equal([]int64{4}, data.SplitOffsets())
 	m.Assert().Equal([]int{1, 1}, data.EqualityFieldIDs())
 	m.Assert().Equal(0, *data.SortOrderID())
+}
+
+func (m *ManifestTestSuite) TestManifestWriterMeta() {
+	sch := NewSchema(0, NestedField{ID: 0, Name: "test01", Type: StringType{}})
+	w, err := NewManifestWriter(2, io.Discard, *UnpartitionedSpec, sch, 1)
+	m.Require().NoError(err)
+	md, err := w.meta()
+	m.Require().NoError(err)
+	m.NotEqual("null", string(md["partition-spec"]))
+	m.Equal("[]", string(md["partition-spec"]))
 }
 
 func TestManifests(t *testing.T) {

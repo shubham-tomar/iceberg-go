@@ -31,7 +31,8 @@ func TestPartitionSpec(t *testing.T) {
 
 	bucket := iceberg.BucketTransform{NumBuckets: 4}
 	idField1 := iceberg.PartitionField{
-		SourceID: 3, FieldID: 1001, Name: "id", Transform: bucket}
+		SourceID: 3, FieldID: 1001, Name: "id", Transform: bucket,
+	}
 	spec1 := iceberg.NewPartitionSpec(idField1)
 
 	assert.Zero(t, spec1.ID())
@@ -46,7 +47,8 @@ func TestPartitionSpec(t *testing.T) {
 
 	// only differs by PartitionField FieldID
 	idField2 := iceberg.PartitionField{
-		SourceID: 3, FieldID: 1002, Name: "id", Transform: bucket}
+		SourceID: 3, FieldID: 1002, Name: "id", Transform: bucket,
+	}
 	spec2 := iceberg.NewPartitionSpec(idField2)
 
 	assert.False(t, spec1.Equals(spec2))
@@ -85,10 +87,14 @@ func TestSerializeUnpartitionedSpec(t *testing.T) {
 
 func TestSerializePartitionSpec(t *testing.T) {
 	spec := iceberg.NewPartitionSpecID(3,
-		iceberg.PartitionField{SourceID: 1, FieldID: 1000,
-			Transform: iceberg.TruncateTransform{Width: 19}, Name: "str_truncate"},
-		iceberg.PartitionField{SourceID: 2, FieldID: 1001,
-			Transform: iceberg.BucketTransform{NumBuckets: 25}, Name: "int_bucket"},
+		iceberg.PartitionField{
+			SourceID: 1, FieldID: 1000,
+			Transform: iceberg.TruncateTransform{Width: 19}, Name: "str_truncate",
+		},
+		iceberg.PartitionField{
+			SourceID: 2, FieldID: 1001,
+			Transform: iceberg.BucketTransform{NumBuckets: 25}, Name: "int_bucket",
+		},
 	)
 
 	data, err := json.Marshal(spec)
@@ -120,14 +126,22 @@ func TestSerializePartitionSpec(t *testing.T) {
 
 func TestPartitionType(t *testing.T) {
 	spec := iceberg.NewPartitionSpecID(3,
-		iceberg.PartitionField{SourceID: 1, FieldID: 1000,
-			Transform: iceberg.TruncateTransform{Width: 19}, Name: "str_truncate"},
-		iceberg.PartitionField{SourceID: 2, FieldID: 1001,
-			Transform: iceberg.BucketTransform{NumBuckets: 25}, Name: "int_bucket"},
-		iceberg.PartitionField{SourceID: 3, FieldID: 1002,
-			Transform: iceberg.IdentityTransform{}, Name: "bool_identity"},
-		iceberg.PartitionField{SourceID: 1, FieldID: 1003,
-			Transform: iceberg.VoidTransform{}, Name: "str_void"},
+		iceberg.PartitionField{
+			SourceID: 1, FieldID: 1000,
+			Transform: iceberg.TruncateTransform{Width: 19}, Name: "str_truncate",
+		},
+		iceberg.PartitionField{
+			SourceID: 2, FieldID: 1001,
+			Transform: iceberg.BucketTransform{NumBuckets: 25}, Name: "int_bucket",
+		},
+		iceberg.PartitionField{
+			SourceID: 3, FieldID: 1002,
+			Transform: iceberg.IdentityTransform{}, Name: "bool_identity",
+		},
+		iceberg.PartitionField{
+			SourceID: 1, FieldID: 1003,
+			Transform: iceberg.VoidTransform{}, Name: "str_void",
+		},
 	)
 
 	expected := &iceberg.StructType{
@@ -140,4 +154,38 @@ func TestPartitionType(t *testing.T) {
 	}
 	actual := spec.PartitionType(tableSchemaSimple)
 	assert.Truef(t, expected.Equals(actual), "expected: %s, got: %s", expected, actual)
+}
+
+type partitionRecord []any
+
+func (p partitionRecord) Size() int            { return len(p) }
+func (p partitionRecord) Get(pos int) any      { return p[pos] }
+func (p partitionRecord) Set(pos int, val any) { p[pos] = val }
+
+func TestPartitionSpecToPath(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "str", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 2, Name: "other_str", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 3, Name: "int", Type: iceberg.PrimitiveTypes.Int32, Required: true})
+
+	spec := iceberg.NewPartitionSpecID(3,
+		iceberg.PartitionField{
+			SourceID: 1, FieldID: 1000,
+			Transform: iceberg.TruncateTransform{Width: 19}, Name: "my#str%bucket",
+		},
+		iceberg.PartitionField{
+			SourceID: 2, FieldID: 1001,
+			Transform: iceberg.IdentityTransform{}, Name: "other str+bucket",
+		},
+		iceberg.PartitionField{
+			SourceID: 3, FieldID: 1002,
+			Transform: iceberg.BucketTransform{NumBuckets: 25}, Name: "my!int:bucket",
+		})
+
+	record := partitionRecord{"my+str", "( )", int32(10)}
+	// both partition field names and values should be URL encoded, with spaces
+	// mapping to plus signs, to match Java behavior:
+	// https://github.com/apache/iceberg/blob/ca3db931b0f024f0412084751ac85dd4ef2da7e7/api/src/main/java/org/apache/iceberg/PartitionSpec.java#L198-L204
+	assert.Equal(t, "my%23str%25bucket=my%2Bstr/other+str%2Bbucket=%28+%29/my%21int%3Abucket=10",
+		spec.PartitionToPath(record, schema))
 }

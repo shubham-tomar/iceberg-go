@@ -21,14 +21,9 @@ import (
 	"cmp"
 	"fmt"
 	"hash/maphash"
-	"io"
 	"maps"
 	"runtime/debug"
-	"strconv"
 	"strings"
-
-	"github.com/apache/iceberg-go/internal"
-	"github.com/hamba/avro/v2/ocf"
 )
 
 var version string
@@ -39,6 +34,7 @@ func init() {
 		for _, dep := range info.Deps {
 			if strings.HasPrefix(dep.Path, "github.com/apache/iceberg-go") {
 				version = dep.Version
+
 				break
 			}
 		}
@@ -58,6 +54,7 @@ func max[T cmp.Ordered](vals ...T) T {
 			out = v
 		}
 	}
+
 	return out
 }
 
@@ -94,6 +91,7 @@ func (a *accessor) Get(s structLike) any {
 		inner = inner.inner
 		val = val.(structLike).Get(inner.pos)
 	}
+
 	return val
 }
 
@@ -115,6 +113,7 @@ func newLiteralSet(vals ...Literal) Set[Literal] {
 	for _, v := range vals {
 		s.addliteral(v)
 	}
+
 	return s
 }
 
@@ -142,15 +141,18 @@ func (l literalSet) Contains(lit Literal) bool {
 		if !ok {
 			return false
 		}
+
 		return lit.Equals(v.orig)
 	case FixedLiteral:
 		v, ok := l[maphash.Bytes(lzseed, []byte(lit))]
 		if !ok {
 			return false
 		}
+
 		return lit.Equals(v.orig)
 	default:
 		_, ok := l[lit]
+
 		return ok
 	}
 }
@@ -164,6 +166,7 @@ func (l literalSet) Members() []Literal {
 			result = append(result, v.orig)
 		}
 	}
+
 	return result
 }
 
@@ -172,6 +175,7 @@ func (l literalSet) Equals(other Set[Literal]) bool {
 	if !ok {
 		return false
 	}
+
 	return maps.EqualFunc(l, rhs, func(v1, v2 struct{ orig Literal }) bool {
 		switch {
 		case v1.orig == nil:
@@ -199,42 +203,6 @@ func (l literalSet) All(fn func(Literal) bool) bool {
 			return false
 		}
 	}
+
 	return true
-}
-
-// Helper function to find the difference between two slices (a - b).
-func Difference(a, b []string) []string {
-	m := make(map[string]bool)
-	for _, item := range b {
-		m[item] = true
-	}
-
-	diff := make([]string, 0)
-	for _, item := range a {
-		if !m[item] {
-			diff = append(diff, item)
-		}
-	}
-	return diff
-}
-
-func avroEncode[T any](key string, version int, vals []T, out io.Writer) error {
-	enc, err := ocf.NewEncoderWithSchema(
-		internal.AvroSchemaCache.Get(key),
-		out, ocf.WithMetadata(map[string][]byte{
-			"format-version": []byte(strconv.Itoa(version)),
-		}),
-		ocf.WithCodec(ocf.Deflate),
-	)
-	if err != nil {
-		return err
-	}
-
-	for _, file := range vals {
-		if err := enc.Encode(file); err != nil {
-			return err
-		}
-	}
-
-	return enc.Close()
 }
