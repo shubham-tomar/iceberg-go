@@ -42,7 +42,7 @@ $ cd iceberg-go/cmd/iceberg && go build .
 | :------------------: | :-------: |
 | S3                   |    X      |
 | Google Cloud Storage |    X      |
-| Azure Blob Storage   |           |
+| Azure Blob Storage   |    X      |
 | Local Filesystem     |    X      |
 
 ### Metadata
@@ -65,8 +65,9 @@ $ cd iceberg-go/cmd/iceberg && go build .
 | Load Table               |  X   |      |          |  X   |  X  |
 | List Tables              |  X   |      |          |  X   |  X  |
 | Create Table             |  X   |      |          |  X   |  X  |
-| Update Current Snapshot  |  X   |      |          |      |     |
-| Create New Snapshot      |  X   |      |          |      |     |
+| Register Table           |  X   |      |          |  X   |     |
+| Update Current Snapshot  |  X   |      |          |      |  X  |
+| Create New Snapshot      |  X   |      |          |      |  X  |
 | Rename Table             |  X   |      |          |  X   |  X  |
 | Drop Table               |  X   |      |          |  X   |  X  |
 | Alter Table              |  X   |      |          |      |  X  |
@@ -75,6 +76,7 @@ $ cd iceberg-go/cmd/iceberg && go build .
 | Check Namespace Exists   |  X   |      |          |  X   |  X  |
 | Drop Namespace           |  X   |      |          |  X   |  X  |
 | Set Namespace Properties |  X   |      |          |  X   |  X  |
+| Create View              |  X   |      |          |      |     |
 | List View                |  X   |      |          |      |     |
 | Drop View                |  X   |      |          |      |     |
 | Check View Exists        |  X   |      |          |      |     |
@@ -90,7 +92,7 @@ the table, the following tracks the current write support:
 
 | Operation         |Supported|
 |:-----------------:|:-------:|
-| Append Stream     |         |
+| Append Stream     |   X     |
 | Append Data Files |   X     |
 | Rewrite Files     |         |
 | Rewrite manifests |         |

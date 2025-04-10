@@ -27,7 +27,6 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/internal"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/utils"
@@ -217,7 +216,7 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 		return nil, fmt.Errorf("failed to load table %s.%s: %w", database, tableName, err)
 	}
 
-	icebergTable, err := table.NewFromLocation([]string{tableName}, location, iofs, c)
+	icebergTable, err := table.NewFromLocation(identifier, location, iofs, c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create table from location %s.%s: %w", database, tableName, err)
 	}
@@ -236,7 +235,7 @@ func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 	if err != nil {
 		return nil, err
 	}
-	var cfg internal.CreateTableCfg
+	var cfg catalog.CreateTableCfg
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -286,6 +285,49 @@ func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 	}
 
 	return createdTable, nil
+}
+
+// RegisterTable registers a new table using existing metadata.
+func (c *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier, metadataLocation string) (*table.Table, error) {
+	database, tableName, err := identifierToGlueTable(identifier)
+	if err != nil {
+		return nil, err
+	}
+	// Load the metadata file to get table properties
+	ctx = utils.WithAwsConfig(ctx, c.awsCfg)
+	iofs, err := io.LoadFS(ctx, nil, metadataLocation)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load metadata file at %s: %w", metadataLocation, err)
+	}
+	// Read the metadata file
+	metadata, err := table.NewFromLocation([]string{tableName}, metadataLocation, iofs, c)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read table metadata from %s: %w", metadataLocation, err)
+	}
+	tableInput := &types.TableInput{
+		Name:       aws.String(tableName),
+		Parameters: map[string]string{},
+		TableType:  aws.String("EXTERNAL_TABLE"),
+		StorageDescriptor: &types.StorageDescriptor{
+			Location: aws.String(metadataLocation),
+			Columns:  schemaToGlueColumns(metadata.Schema()),
+		},
+	}
+	_, err = c.glueSvc.CreateTable(ctx, &glue.CreateTableInput{
+		CatalogId:    c.catalogId,
+		DatabaseName: aws.String(database),
+		TableInput:   tableInput,
+		OpenTableFormatInput: &types.OpenTableFormatInput{
+			IcebergInput: &types.IcebergInput{
+				MetadataOperation: types.MetadataOperationCreate,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to register table %s.%s: %w", database, tableName, err)
+	}
+
+	return c.LoadTable(ctx, identifier, nil)
 }
 
 func (c *Catalog) CommitTable(context.Context, *table.Table, []table.Requirement, []table.Update) (table.Metadata, string, error) {
