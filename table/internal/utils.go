@@ -231,19 +231,19 @@ func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *ic
 }
 
 func (d *DataFileStatistics) ToDataFile(schema *iceberg.Schema, spec iceberg.PartitionSpec, path string, format iceberg.FileFormat, filesize int64) iceberg.DataFile {
-	var partitionData map[string]any
+	var fieldIDToPartitionData map[int]any
 	if !spec.Equals(*iceberg.UnpartitionedSpec) {
-		partitionData = make(map[string]any)
+		fieldIDToPartitionData = make(map[int]any)
 		for field := range spec.Fields() {
 			val := d.PartitionValue(field, schema)
 			if val != nil {
-				partitionData[field.Name] = val
+				fieldIDToPartitionData[field.FieldID] = val
 			}
 		}
 	}
 
 	bldr, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentData,
-		path, format, partitionData, d.RecordCount, filesize)
+		path, format, fieldIDToPartitionData, d.RecordCount, filesize)
 	if err != nil {
 		panic(err)
 	}
@@ -509,14 +509,13 @@ func MapExec[T, S any](nWorkers int, slice iter.Seq[T], fn func(T) (S, error)) i
 		})
 	}
 
-	for v := range slice {
-		ch <- v
-	}
-	close(ch)
-
 	var err error
 	go func() {
 		defer close(out)
+		for v := range slice {
+			ch <- v
+		}
+		close(ch)
 		err = g.Wait()
 	}()
 

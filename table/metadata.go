@@ -372,7 +372,7 @@ func (b *MetadataBuilder) SetCurrentSchemaID(currentSchemaID int) (*MetadataBuil
 			return s.ID
 		})
 		if !slices.ContainsFunc(b.updates, func(u Update) bool {
-			return u.Action() == updateAddSchema && u.(*addSchemaUpdate).Schema.ID == currentSchemaID
+			return u.Action() == UpdateAddSchema && u.(*addSchemaUpdate).Schema.ID == currentSchemaID
 		}) {
 			return nil, errors.New("can't set current schema to last added schema, no schema has been added")
 		}
@@ -399,7 +399,7 @@ func (b *MetadataBuilder) SetDefaultSortOrderID(defaultSortOrderID int) (*Metada
 			return s.OrderID
 		})
 		if !slices.ContainsFunc(b.updates, func(u Update) bool {
-			return u.Action() == updateSortOrder && u.(*addSortOrderUpdate).SortOrder.OrderID == defaultSortOrderID
+			return u.Action() == UpdateAddSortOrder && u.(*addSortOrderUpdate).SortOrder.OrderID == defaultSortOrderID
 		}) {
 			return nil, errors.New("can't set default sort order to last added with no added sort orders")
 		}
@@ -425,7 +425,7 @@ func (b *MetadataBuilder) SetDefaultSpecID(defaultSpecID int) (*MetadataBuilder,
 			return s.ID()
 		})
 		if !slices.ContainsFunc(b.updates, func(u Update) bool {
-			return u.Action() == updateSpec && u.(*addPartitionSpecUpdate).Spec.ID() == defaultSpecID
+			return u.Action() == UpdateAddSpec && u.(*addPartitionSpecUpdate).Spec.ID() == defaultSpecID
 		}) {
 			return nil, errors.New("can't set default spec to last added with no added partition specs")
 		}
@@ -564,7 +564,7 @@ func (b *MetadataBuilder) SetSnapshotRef(
 	}
 
 	isAddedSnapshot := slices.ContainsFunc(b.updates, func(u Update) bool {
-		return u.Action() == updateSnapshot && u.(*addSnapshotUpdate).Snapshot.SnapshotID == snapshotID
+		return u.Action() == UpdateAddSnapshot && u.(*addSnapshotUpdate).Snapshot.SnapshotID == snapshotID
 	})
 	if isAddedSnapshot {
 		b.lastUpdatedMS = snapshot.TimestampMs
@@ -583,7 +583,7 @@ func (b *MetadataBuilder) SetSnapshotRef(
 	}
 
 	if slices.ContainsFunc(b.updates, func(u Update) bool {
-		return u.Action() == updateSnapshot && u.(*addSnapshotUpdate).Snapshot.SnapshotID == snapshotID
+		return u.Action() == UpdateAddSnapshot && u.(*addSnapshotUpdate).Snapshot.SnapshotID == snapshotID
 	}) {
 		b.lastUpdatedMS = snapshot.TimestampMs
 	}
@@ -1067,7 +1067,7 @@ func (c *commonMetadata) validate() error {
 	case c.LastUpdatedMS == 0:
 		// last-updated-ms is required
 		return fmt.Errorf("%w: missing last-updated-ms", ErrInvalidMetadata)
-	case c.LastColumnId == 0:
+	case c.LastColumnId < 0:
 		// last-column-id is required
 		return fmt.Errorf("%w: missing last-column-id", ErrInvalidMetadata)
 	}
@@ -1145,6 +1145,9 @@ func (m *metadataV1) UnmarshalJSON(b []byte) error {
 	type Alias metadataV1
 	aux := (*Alias)(m)
 
+	// Set LastColumnId to -1 to indicate that it is not set as LastColumnId = 0 is a valid value for when no schema is present
+	aux.LastColumnId = -1
+
 	if err := json.Unmarshal(b, aux); err != nil {
 		return err
 	}
@@ -1189,6 +1192,9 @@ func (m *metadataV2) Equals(other Metadata) bool {
 func (m *metadataV2) UnmarshalJSON(b []byte) error {
 	type Alias metadataV2
 	aux := (*Alias)(m)
+
+	// Set LastColumnId to -1 to indicate that it is not set as LastColumnId = 0 is a valid value for when no schema is present
+	aux.LastColumnId = -1
 
 	if err := json.Unmarshal(b, aux); err != nil {
 		return err

@@ -21,10 +21,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -38,6 +42,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/google/uuid"
 	"github.com/pterm/pterm"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uptrace/bun/driver/sqliteshim"
 )
@@ -320,12 +325,12 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
 			Operation: table.OpAppend,
 			Properties: iceberg.Properties{
 				"added-data-files":       "5",
-				"added-files-size":       "3660",
+				"added-files-size":       "3600",
 				"added-records":          "5",
 				"total-data-files":       "5",
 				"total-delete-files":     "0",
 				"total-equality-deletes": "0",
-				"total-files-size":       "3660",
+				"total-files-size":       "3600",
 				"total-position-deletes": "0",
 				"total-records":          "5",
 			},
@@ -460,13 +465,13 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 			Operation: table.OpAppend,
 			Properties: iceberg.Properties{
 				"added-data-files":        "5",
-				"added-files-size":        "3660",
+				"added-files-size":        "3600",
 				"added-records":           "5",
 				"changed-partition-count": "1",
 				"total-data-files":        "5",
 				"total-delete-files":      "0",
 				"total-equality-deletes":  "0",
-				"total-files-size":        "3660",
+				"total-files-size":        "3600",
 				"total-position-deletes":  "0",
 				"total-records":           "5",
 			},
@@ -480,8 +485,8 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 		t.Require().NoError(err)
 
 		for _, e := range entries {
-			t.Equal(map[string]any{
-				"baz": 123, "qux_month": 650,
+			t.Equal(map[int]any{
+				1000: 123, 1001: 650,
 			}, e.DataFile().Partition())
 		}
 	}
@@ -825,15 +830,15 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 		Operation: table.OpOverwrite,
 		Properties: iceberg.Properties{
 			"added-data-files":       "1",
-			"added-files-size":       "1082",
+			"added-files-size":       "1068",
 			"added-records":          "4",
 			"deleted-data-files":     "2",
 			"deleted-records":        "4",
-			"removed-files-size":     "2164",
+			"removed-files-size":     "2136",
 			"total-data-files":       "4",
 			"total-delete-files":     "0",
 			"total-equality-deletes": "0",
-			"total-files-size":       "4328",
+			"total-files-size":       "4272",
 			"total-position-deletes": "0",
 			"total-records":          "10",
 		},
@@ -1134,4 +1139,212 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 func TestTableWriting(t *testing.T) {
 	suite.Run(t, &TableWritingTestSuite{formatVersion: 1})
 	suite.Run(t, &TableWritingTestSuite{formatVersion: 2})
+}
+
+func TestNullableStructRequiredField(t *testing.T) {
+	loc := t.TempDir()
+
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + loc,
+	})
+	require.NoError(t, err)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "analytic", Type: arrow.StructOf(
+				arrow.Field{Name: "category", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "desc", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "related_analytics", Type: arrow.ListOf(
+					arrow.StructOf(
+						arrow.Field{Name: "category", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "desc", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "type", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "type_id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+						arrow.Field{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "version", Type: arrow.BinaryTypes.String, Nullable: true},
+					),
+				), Nullable: true},
+				arrow.Field{Name: "type", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "type_id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+				arrow.Field{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "version", Type: arrow.BinaryTypes.String, Nullable: true},
+			), Nullable: true,
+		},
+		{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	sc, err := table.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, false)
+	require.NoError(t, err)
+
+	ctx := context.TODO()
+	require.NoError(t, cat.CreateNamespace(ctx, table.Identifier{"testing"}, nil))
+	tbl, err := cat.CreateTable(ctx, table.Identifier{"testing", "nullable_struct_required_field"}, sc,
+		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
+		catalog.WithLocation(loc))
+	require.NoError(t, err)
+	require.NotNil(t, tbl)
+
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer bldr.Release()
+
+	const N = 100
+	bldr.Field(0).AppendNulls(N)
+	bldr.Field(1).AppendNulls(N)
+
+	rec := bldr.NewRecord()
+	defer rec.Release()
+
+	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.Record{rec})
+	defer arrTable.Release()
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AppendTable(ctx, arrTable, N, nil))
+	stagedTbl, err := tx.StagedTable()
+	require.NoError(t, err)
+	require.NotNil(t, stagedTbl)
+}
+
+type DeleteOldMetadataMockedCatalog struct{}
+
+func (m *DeleteOldMetadataMockedCatalog) LoadTable(ctx context.Context, ident table.Identifier, props iceberg.Properties) (*table.Table, error) {
+	return nil, nil
+}
+
+func (m *DeleteOldMetadataMockedCatalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	bldr, err := table.MetadataBuilderFromBase(tbl.Metadata())
+	if err != nil {
+		return nil, "", err
+	}
+
+	location := tbl.Metadata().Location()
+
+	randid := uuid.New().String()
+	metdatafile := fmt.Sprintf("%s/metadata/%s.metadata.json", location, randid)
+
+	// removing old metadata files
+	bldr.TrimMetadataLogs(0)
+
+	bldr.AppendMetadataLog(table.MetadataLogEntry{
+		MetadataFile: metdatafile,
+		TimestampMs:  time.Now().UnixMilli(),
+	})
+
+	for _, u := range updates {
+		if err := u.Apply(bldr); err != nil {
+			return nil, "", err
+		}
+	}
+
+	meta, err := bldr.Build()
+	if err != nil {
+		return nil, "", err
+	}
+
+	return meta, metdatafile, nil
+}
+
+func createMetadataFile(metadatadir, metadataFile string) error {
+	// Ensure the directory exists
+	metadataDir := filepath.Dir(metadatadir)
+	err := os.MkdirAll(metadataDir, 0o755)
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(metadataFile, []byte("first commit metadata content"), 0o644)
+
+	return err
+}
+
+func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
+	// capture logs to validate that no error is logged
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr) // restore default output
+
+	fs := iceio.LocalFS{}
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/file_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{"format-version": strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+	t.Require().NoError(err)
+
+	tbl := table.New(ident, meta, t.getMetadataLoc(), fs, &DeleteOldMetadataMockedCatalog{})
+	ctx := context.Background()
+
+	// transaction 1 to create metadata file
+	tx := tbl.NewTransaction()
+	tx.AddFiles(ctx, files[0:1], nil, false)
+	tbl_new, err := tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// transaction 2 to add files
+	tx_new := tbl_new.NewTransaction()
+	tx_new.AddFiles(ctx, files[1:2], nil, false)
+
+	_, err = tx_new.Commit(ctx)
+	t.Require().NoError(err)
+
+	// validate that error is logged
+	logOutput := logBuf.String()
+	t.Contains(logOutput, "Warning: Failed to delete old metadata file")
+	t.Contains(logOutput, "no such file or directory")
+}
+
+func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
+	// capture logs to validate that no error is logged
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr) // restore default output
+
+	fs := iceio.LocalFS{}
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/file_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.location, iceberg.Properties{"format-version": strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+	t.Require().NoError(err)
+
+	tbl := table.New(ident, meta, t.getMetadataLoc(), fs, &DeleteOldMetadataMockedCatalog{})
+
+	ctx := context.Background()
+
+	// transaction 1 to create metadata file
+	tx := tbl.NewTransaction()
+	tx.AddFiles(ctx, files[0:1], nil, false)
+	tbl_new, err := tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// Now we have the first metadata location - create the file there so that deleteOldMetadata does not log an error
+	firstMetadataLoc := tbl_new.MetadataLocation()
+	metadataFile := tbl_new.MetadataLocation()
+	err = createMetadataFile(firstMetadataLoc, metadataFile)
+	t.Require().NoError(err)
+
+	// transaction 2 to add files
+	tx_new := tbl_new.NewTransaction()
+	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	_, err = tx_new.Commit(ctx)
+	t.Require().NoError(err)
+
+	// validate that no error is logged
+	logOutput := logBuf.String()
+	t.NotContains(logOutput, "Warning: Failed to delete old metadata file")
+	t.NotContains(logOutput, "no such file or directory")
 }

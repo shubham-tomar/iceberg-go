@@ -428,7 +428,6 @@ func getFieldIDMap(sc avro.Schema) (map[string]int, map[int]avro.LogicalType) {
 					avroTyp = t
 				}
 			}
-
 			if ps, ok := avroTyp.(*avro.PrimitiveSchema); ok && ps.Logical() != nil {
 				logicalTypes[int(fid)] = ps.Logical().Type()
 			}
@@ -450,61 +449,7 @@ func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) ([]M
 	}
 	defer f.Close()
 
-	dec, err := ocf.NewDecoder(f)
-	if err != nil {
-		return nil, err
-	}
-
-	metadata := dec.Metadata()
-	sc, err := avro.ParseBytes(dec.Metadata()["avro.schema"])
-	if err != nil {
-		return nil, err
-	}
-
-	fieldNameToID, fieldIDToLogicalType := getFieldIDMap(sc)
-	isFallback := false
-	if string(metadata["format-version"]) == "1" {
-		for _, f := range sc.(*avro.RecordSchema).Fields() {
-			if f.Name() == "snapshot_id" {
-				if f.Type().Type() != avro.Union {
-					isFallback = true
-				}
-
-				break
-			}
-		}
-	}
-
-	results := make([]ManifestEntry, 0)
-	for dec.HasNext() {
-		var tmp ManifestEntry
-		if isFallback {
-			tmp = &fallbackManifestEntry{
-				manifestEntry: manifestEntry{Data: &dataFile{}},
-			}
-		} else {
-			tmp = &manifestEntry{Data: &dataFile{}}
-		}
-
-		if err := dec.Decode(tmp); err != nil {
-			return nil, err
-		}
-
-		if isFallback {
-			tmp = tmp.(*fallbackManifestEntry).toEntry()
-		}
-
-		if !discardDeleted || tmp.Status() != EntryStatusDELETED {
-			tmp.inherit(m)
-			if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
-				fieldToIDMap.setFieldNameToIDMap(fieldNameToID)
-				fieldToIDMap.setFieldIDToLogicalTypeMap(fieldIDToLogicalType)
-			}
-			results = append(results, tmp)
-		}
-	}
-
-	return results, dec.Error()
+	return ReadManifest(m, f, discardDeleted)
 }
 
 // ManifestFile is the interface which covers both V1 and V2 manifest files.
@@ -613,10 +558,217 @@ func decodeManifests[I interface {
 	return results, dec.Error()
 }
 
+// ManifestReader reads the metadata and data from an avro manifest file.
+// This type is not thread-safe; its methods should not be called from
+// multiple goroutines.
+type ManifestReader struct {
+	dec           *ocf.Decoder
+	file          ManifestFile
+	formatVersion int
+	isFallback    bool
+	content       ManifestContent
+	fieldNameToID map[string]int
+	fieldIDToType map[int]avro.LogicalType
+
+	// The rest are lazily populated, on demand. Most readers
+	// will likely only try to load the entries.
+	schema              Schema
+	schemaLoaded        bool
+	partitionSpec       PartitionSpec
+	partitionSpecLoaded bool
+}
+
+// NewManifestReader returns a value that can read the contents of an avro manifest
+// file. If the caller is interested in the manifest entries in the file, it must call
+// [ManifestReader.Entries] before closing the provided reader.
+func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error) {
+	dec, err := ocf.NewDecoder(in, ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := dec.Metadata()
+	sc := dec.Schema()
+
+	formatVersion, err := strconv.Atoi(string(metadata["format-version"]))
+	if err != nil {
+		return nil, fmt.Errorf("manifest file's 'format-version' metadata is invalid: %w", err)
+	}
+	if formatVersion != file.Version() {
+		return nil, fmt.Errorf("manifest file's 'format-version' metadata indicates version %d, but entry from manifest list indicates version %d",
+			formatVersion, file.Version())
+	}
+
+	var content ManifestContent
+	switch contentStr := string(metadata["content"]); contentStr {
+	case "data":
+		content = ManifestContentData
+	case "deletes":
+		content = ManifestContentDeletes
+	default:
+		return nil, fmt.Errorf("manifest file's 'content' metadata is invalid, should be \"data\" or \"deletes\" but instead is %q",
+			contentStr)
+	}
+	if content != file.ManifestContent() {
+		return nil, fmt.Errorf("manifest file's 'content' metadata indicates %q, but entry from manifest list indicates %q",
+			content.String(), file.ManifestContent().String())
+	}
+
+	isFallback := false
+	if formatVersion == 1 {
+		for _, f := range sc.(*avro.RecordSchema).Fields() {
+			if f.Name() == "snapshot_id" {
+				if f.Type().Type() != avro.Union {
+					isFallback = true
+				}
+
+				break
+			}
+		}
+	}
+	fieldNameToID, fieldIDToType := getFieldIDMap(sc)
+
+	return &ManifestReader{
+		dec:           dec,
+		file:          file,
+		formatVersion: formatVersion,
+		isFallback:    isFallback,
+		content:       content,
+		fieldNameToID: fieldNameToID,
+		fieldIDToType: fieldIDToType,
+	}, nil
+}
+
+// Version returns the file's format version.
+func (c *ManifestReader) Version() int {
+	return c.formatVersion
+}
+
+// ManifestContent returns the type of content in the manifest file.
+func (c *ManifestReader) ManifestContent() ManifestContent {
+	return c.content
+}
+
+// SchemaID returns the schema ID encoded in the avro file's metadata.
+func (c *ManifestReader) SchemaID() (int, error) {
+	id, err := strconv.Atoi(string(c.dec.Metadata()["schema-id"]))
+	if err != nil {
+		return 0, fmt.Errorf("manifest file's 'schema-id' metadata is invalid: %w", err)
+	}
+
+	return id, nil
+}
+
+// Schema returns the schema encoded in the avro file's metadata.
+func (c *ManifestReader) Schema() (*Schema, error) {
+	if !c.schemaLoaded {
+		schemaID, err := c.SchemaID()
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(c.dec.Metadata()["schema"], &c.schema); err != nil {
+			return nil, fmt.Errorf("manifest file's 'schema' metadata is invalid: %w", err)
+		}
+		c.schema.ID = schemaID
+		c.schemaLoaded = true
+	}
+
+	return &c.schema, nil
+}
+
+// PartitionSpecID returns the partition spec ID encoded in the avro file's metadata.
+func (c *ManifestReader) PartitionSpecID() (int, error) {
+	id, err := strconv.Atoi(string(c.dec.Metadata()["partition-spec-id"]))
+	if err != nil {
+		return 0, fmt.Errorf("manifest file's 'partition-spec-id' metadata is invalid: %w", err)
+	}
+	if id != int(c.file.PartitionSpecID()) {
+		return 0, fmt.Errorf("manifest file's 'partition-spec-id' metadata indicates %d, but entry from manifest list indicates %d",
+			id, c.file.PartitionSpecID())
+	}
+
+	return id, nil
+}
+
+// PartitionSpec returns the partition spec encoded in the avro file's metadata.
+func (c *ManifestReader) PartitionSpec() (*PartitionSpec, error) {
+	if !c.partitionSpecLoaded {
+		partitionSpecID, err := c.PartitionSpecID()
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(c.dec.Metadata()["partition-spec"], &c.partitionSpec.fields); err != nil {
+			return nil, fmt.Errorf("manifest file's 'partition-spec' metadata is invalid: %w", err)
+		}
+		c.partitionSpec.id = partitionSpecID
+		c.partitionSpec.initialize()
+		c.partitionSpecLoaded = true
+	}
+
+	return &c.partitionSpec, nil
+}
+
+// ReadEntry reads the next manifest entry in the avro file's data.
+func (c *ManifestReader) ReadEntry() (ManifestEntry, error) {
+	if err := c.dec.Error(); err != nil {
+		return nil, err
+	}
+	if !c.dec.HasNext() {
+		return nil, io.EOF
+	}
+	var tmp ManifestEntry
+	if c.isFallback {
+		tmp = &fallbackManifestEntry{
+			manifestEntry: manifestEntry{Data: &dataFile{}},
+		}
+	} else {
+		tmp = &manifestEntry{Data: &dataFile{}}
+	}
+
+	if err := c.dec.Decode(tmp); err != nil {
+		return nil, err
+	}
+	if c.isFallback {
+		tmp = tmp.(*fallbackManifestEntry).toEntry()
+	}
+	tmp.inherit(c.file)
+	if fieldToIDMap, ok := tmp.DataFile().(hasFieldToIDMap); ok {
+		fieldToIDMap.setFieldNameToIDMap(c.fieldNameToID)
+		fieldToIDMap.setFieldIDToLogicalTypeMap(c.fieldIDToType)
+	}
+
+	return tmp, nil
+}
+
+// ReadManifest reads in an avro list file and returns a slice
+// of manifest entries or an error if one is encountered. If discardDeleted
+// is true, the returned slice omits entries whose status is "deleted".
+func ReadManifest(m ManifestFile, f io.Reader, discardDeleted bool) ([]ManifestEntry, error) {
+	manifestReader, err := NewManifestReader(m, f)
+	if err != nil {
+		return nil, err
+	}
+	var results []ManifestEntry
+	for {
+		entry, err := manifestReader.ReadEntry()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return results, nil
+			}
+
+			return results, err
+		}
+		if discardDeleted && entry.Status() == EntryStatusDELETED {
+			continue
+		}
+		results = append(results, entry)
+	}
+}
+
 // ReadManifestList reads in an avro manifest list file and returns a slice
 // of manifest files or an error if one is encountered.
 func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
-	dec, err := ocf.NewDecoder(in)
+	dec, err := ocf.NewDecoder(in, ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
 	if err != nil {
 		return nil, err
 	}
@@ -806,7 +958,7 @@ func (p *partitionFieldStats[T]) update(value any) {
 	}
 }
 
-func constructPartitionSummaries(spec PartitionSpec, schema *Schema, partitions []map[string]any) ([]FieldSummary, error) {
+func constructPartitionSummaries(spec PartitionSpec, schema *Schema, partitions []map[int]any) ([]FieldSummary, error) {
 	partType := spec.PartitionType(schema)
 	fieldStats := make([]fieldStats, len(partType.FieldList))
 	for i, field := range partType.FieldList {
@@ -820,7 +972,7 @@ func constructPartitionSummaries(spec PartitionSpec, schema *Schema, partitions 
 
 	for _, part := range partitions {
 		for i, field := range partType.FieldList {
-			fieldStats[i].update(part[field.Name])
+			fieldStats[i].update(part[field.ID])
 		}
 	}
 
@@ -851,7 +1003,7 @@ type ManifestWriter struct {
 	deletedFiles  int32
 	deletedRows   int64
 
-	partitions  []map[string]any
+	partitions  []map[int]any
 	minSeqNum   int64
 	reusedEntry manifestEntry
 }
@@ -886,7 +1038,7 @@ func NewManifestWriter(version int, out io.Writer, spec PartitionSpec, schema *S
 		schema:     schema,
 		snapshotID: snapshotID,
 		minSeqNum:  -1,
-		partitions: make([]map[string]any, 0),
+		partitions: make([]map[int]any, 0),
 	}
 
 	md, err := w.meta()
@@ -896,6 +1048,7 @@ func NewManifestWriter(version int, out io.Writer, spec PartitionSpec, schema *S
 
 	enc, err := ocf.NewEncoderWithSchema(fileSchema, out,
 		ocf.WithSchemaMarshaler(ocf.FullSchemaMarshaler),
+		ocf.WithEncoderSchemaCache(&avro.SchemaCache{}),
 		ocf.WithMetadata(md),
 		ocf.WithCodec(ocf.Deflate))
 
@@ -1088,6 +1241,7 @@ func (m *ManifestListWriter) init(meta map[string][]byte) error {
 
 	enc, err := ocf.NewEncoderWithSchema(fileSchema, m.out,
 		ocf.WithSchemaMarshaler(ocf.FullSchemaMarshaler),
+		ocf.WithEncoderSchemaCache(&avro.SchemaCache{}),
 		ocf.WithMetadata(meta),
 		ocf.WithCodec(ocf.Deflate))
 	if err != nil {
@@ -1296,28 +1450,26 @@ func mapToAvroColMap[K comparable, V any](m map[K]V) *[]colMap[K, V] {
 	return &out
 }
 
-func avroPartitionData(input map[string]any, nameToID map[string]int, logicalTypes map[int]avro.LogicalType) map[string]any {
-	out := make(map[string]any)
+func avroPartitionData(input map[int]any, logicalTypes map[int]avro.LogicalType) map[int]any {
+	out := make(map[int]any)
 	for k, v := range input {
-		if id, ok := nameToID[k]; ok {
-			if logical, ok := logicalTypes[id]; ok {
-				switch logical {
-				case avro.Date:
-					out[k] = Date(v.(time.Time).Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
-				case avro.TimeMillis:
-					out[k] = Time(v.(time.Duration).Milliseconds())
-				case avro.TimeMicros:
-					out[k] = Time(v.(time.Duration).Microseconds())
-				case avro.TimestampMillis:
-					out[k] = Timestamp(v.(time.Time).UTC().UnixMilli())
-				case avro.TimestampMicros:
-					out[k] = Timestamp(v.(time.Time).UTC().UnixMicro())
-				default:
-					out[k] = v
-				}
-
-				continue
+		if logical, ok := logicalTypes[k]; ok {
+			switch logical {
+			case avro.Date:
+				out[k] = Date(v.(time.Time).Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
+			case avro.TimeMillis:
+				out[k] = Time(v.(time.Duration).Milliseconds())
+			case avro.TimeMicros:
+				out[k] = Time(v.(time.Duration).Microseconds())
+			case avro.TimestampMillis:
+				out[k] = Timestamp(v.(time.Time).UTC().UnixMilli())
+			case avro.TimestampMicros:
+				out[k] = Timestamp(v.(time.Time).UTC().UnixMicro())
+			default:
+				out[k] = v
 			}
+
+			continue
 		}
 		out[k] = v
 	}
@@ -1353,11 +1505,10 @@ type dataFile struct {
 	lowerBoundMap  map[int][]byte
 	upperBoundMap  map[int][]byte
 
-	// not used for anything yet, but important to maintain the information
-	// for future development and updates such as when we get to writes,
-	// and scan planning
-	fieldNameToID        map[string]int
-	fieldIDToLogicalType map[int]avro.LogicalType
+	// used for partition retrieval
+	fieldNameToID          map[string]int
+	fieldIDToLogicalType   map[int]avro.LogicalType
+	fieldIDToPartitionData map[int]any
 
 	specID   int32
 	initMaps sync.Once
@@ -1372,7 +1523,16 @@ func (d *dataFile) initializeMapData() {
 		d.distinctCntMap = avroColMapToMap(d.DistinctCounts)
 		d.lowerBoundMap = avroColMapToMap(d.LowerBounds)
 		d.upperBoundMap = avroColMapToMap(d.UpperBounds)
-		d.PartitionData = avroPartitionData(d.PartitionData, d.fieldNameToID, d.fieldIDToLogicalType)
+		// Populate fieldIDToPartition map if dataFile read from manifest file
+		if len(d.fieldIDToPartitionData) < len(d.PartitionData) {
+			d.fieldIDToPartitionData = make(map[int]any, len(d.PartitionData))
+			for k, v := range d.PartitionData {
+				if id, ok := d.fieldNameToID[k]; ok {
+					d.fieldIDToPartitionData[id] = v
+				}
+			}
+		}
+		d.fieldIDToPartitionData = avroPartitionData(d.fieldIDToPartitionData, d.fieldIDToLogicalType)
 	})
 }
 
@@ -1384,10 +1544,12 @@ func (d *dataFile) setFieldIDToLogicalTypeMap(m map[int]avro.LogicalType) {
 func (d *dataFile) ContentType() ManifestEntryContent { return d.Content }
 func (d *dataFile) FilePath() string                  { return d.Path }
 func (d *dataFile) FileFormat() FileFormat            { return d.Format }
-func (d *dataFile) Partition() map[string]any {
+
+// Partition returns the partition data as a map of partition field ID to value.
+func (d *dataFile) Partition() map[int]any {
 	d.initializeMapData()
 
-	return d.PartitionData
+	return d.fieldIDToPartitionData
 }
 
 func (d *dataFile) Count() int64         { return d.RecordCount }
@@ -1592,7 +1754,7 @@ func NewDataFileBuilder(
 	content ManifestEntryContent,
 	path string,
 	format FileFormat,
-	partitionData map[string]any,
+	fieldIDToPartitionData map[int]any,
 	recordCount int64,
 	fileSize int64,
 ) (*DataFileBuilder, error) {
@@ -1621,16 +1783,26 @@ func NewDataFileBuilder(
 	if fileSize <= 0 {
 		return nil, fmt.Errorf("%w: file size must be greater than 0", ErrInvalidArgument)
 	}
+	partitionData := make(map[string]any)
+	fieldNameToID := make(map[string]int)
+	for _, p := range spec.fields {
+		if pData, ok := fieldIDToPartitionData[p.FieldID]; ok {
+			partitionData[p.Name] = pData
+			fieldNameToID[p.Name] = p.FieldID
+		}
+	}
 
 	return &DataFileBuilder{
 		d: &dataFile{
-			Content:       content,
-			Path:          path,
-			Format:        format,
-			PartitionData: partitionData,
-			RecordCount:   recordCount,
-			FileSize:      fileSize,
-			specID:        int32(spec.id),
+			Content:                content,
+			Path:                   path,
+			Format:                 format,
+			PartitionData:          partitionData,
+			RecordCount:            recordCount,
+			FileSize:               fileSize,
+			specID:                 int32(spec.id),
+			fieldIDToPartitionData: fieldIDToPartitionData,
+			fieldNameToID:          fieldNameToID,
 		},
 	}, nil
 }
@@ -1734,10 +1906,11 @@ type DataFile interface {
 	FilePath() string
 	// FileFormat is the format of the data file, AVRO, Orc, or Parquet.
 	FileFormat() FileFormat
-	// Partition returns a mapping of field name to partition value for
+	// Partition returns a mapping of field id to partition value for
 	// each of the partition spec's fields.
-	Partition() map[string]any
-	// Count returns the number of records in this file.
+	Partition() map[int]any
+	// PartitionFieldData returns a mapping of field id to partition value
+	// for each of the partition spec's fields.
 	Count() int64
 	// FileSizeBytes is the total file size in bytes.
 	FileSizeBytes() int64
