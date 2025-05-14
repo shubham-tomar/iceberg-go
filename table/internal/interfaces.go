@@ -26,8 +26,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
-	"github.com/apache/iceberg-go"
-	iceio "github.com/apache/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go"
+	iceio "github.com/shubham-tomar/iceberg-go/io"
 )
 
 // GetFile opens the given file using the provided file system.

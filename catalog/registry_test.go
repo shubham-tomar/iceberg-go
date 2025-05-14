@@ -25,11 +25,11 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	_ "github.com/apache/iceberg-go/catalog/glue"
-	"github.com/apache/iceberg-go/catalog/rest"
-	"github.com/apache/iceberg-go/config"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/catalog"
+	_ "github.com/shubham-tomar/iceberg-go/catalog/glue"
+	"github.com/shubham-tomar/iceberg-go/catalog/rest"
+	"github.com/shubham-tomar/iceberg-go/config"
 	"github.com/stretchr/testify/assert"
 )
 

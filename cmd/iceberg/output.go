@@ -25,8 +25,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/table"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/table"
 
 	"github.com/google/uuid"
 	"github.com/pterm/pterm"

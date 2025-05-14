@@ -26,7 +26,7 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/apache/iceberg-go/utils"
+	"github.com/shubham-tomar/iceberg-go/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"

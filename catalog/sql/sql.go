@@ -29,11 +29,11 @@ import (
 	"sync"
 	_ "unsafe"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/internal"
-	"github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/table"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/catalog"
+	"github.com/shubham-tomar/iceberg-go/catalog/internal"
+	"github.com/shubham-tomar/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go/table"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/feature"
 	"github.com/uptrace/bun/dialect/mssqldialect"
@@ -738,7 +738,7 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 // avoid circular dependency while still avoiding having to export the getUpdatedPropsAndUpdateSummary function
 // so that we can re-use it in the catalog implementations without duplicating the code.
 
-//go:linkname getUpdatedPropsAndUpdateSummary github.com/apache/iceberg-go/catalog.getUpdatedPropsAndUpdateSummary
+//go:linkname getUpdatedPropsAndUpdateSummary github.com/shubham-tomar/iceberg-go/catalog.getUpdatedPropsAndUpdateSummary
 func getUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals []string, updates iceberg.Properties) (iceberg.Properties, catalog.PropertiesUpdateSummary, error)
 
 func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table.Identifier, removals []string, updates iceberg.Properties) (catalog.PropertiesUpdateSummary, error) {

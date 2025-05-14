@@ -21,13 +21,13 @@ package io_test
 
 import (
 	"context"
-	"github.com/apache/iceberg-go/internal/recipe"
+	"github.com/shubham-tomar/iceberg-go/internal/recipe"
 	"testing"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	sqlcat "github.com/apache/iceberg-go/catalog/sql"
-	"github.com/apache/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/catalog"
+	sqlcat "github.com/shubham-tomar/iceberg-go/catalog/sql"
+	"github.com/shubham-tomar/iceberg-go/io"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun/driver/sqliteshim"
 )

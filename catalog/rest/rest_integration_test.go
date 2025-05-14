@@ -28,11 +28,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/rest"
-	"github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/table"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/catalog"
+	"github.com/shubham-tomar/iceberg-go/catalog/rest"
+	"github.com/shubham-tomar/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go/table"
 	"github.com/stretchr/testify/suite"
 )
 

@@ -30,10 +30,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/rest"
-	"github.com/apache/iceberg-go/table"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/catalog"
+	"github.com/shubham-tomar/iceberg-go/catalog/rest"
+	"github.com/shubham-tomar/iceberg-go/table"
 	"github.com/stretchr/testify/suite"
 )
 

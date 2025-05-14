@@ -20,7 +20,7 @@ package table
 import (
 	"fmt"
 
-	"github.com/apache/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go"
 	"github.com/google/uuid"
 )
 

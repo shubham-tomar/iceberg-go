@@ -29,8 +29,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go/io"
 	"github.com/google/uuid"
 )
 

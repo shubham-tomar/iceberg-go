@@ -17,7 +17,7 @@
 
 package table
 
-import "github.com/apache/iceberg-go/table/internal"
+import "github.com/shubham-tomar/iceberg-go/table/internal"
 
 const (
 	WriteDataPathKey                        = "write.data.path"

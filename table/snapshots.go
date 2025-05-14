@@ -27,8 +27,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/apache/iceberg-go"
-	iceio "github.com/apache/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go"
+	iceio "github.com/shubham-tomar/iceberg-go/io"
 )
 
 type Operation string

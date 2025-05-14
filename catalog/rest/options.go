@@ -21,7 +21,7 @@ import (
 	"crypto/tls"
 	"net/url"
 
-	"github.com/apache/iceberg-go"
+	"github.com/shubham-tomar/iceberg-go"
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
 

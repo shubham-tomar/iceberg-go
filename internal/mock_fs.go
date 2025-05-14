@@ -22,7 +22,7 @@ import (
 	"errors"
 	"io/fs"
 
-	"github.com/apache/iceberg-go/io"
+	"github.com/shubham-tomar/iceberg-go/io"
 	"github.com/stretchr/testify/mock"
 )
 
